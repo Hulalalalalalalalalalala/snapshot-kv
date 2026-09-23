@@ -30,11 +30,14 @@ type view map[string]*node
 
 // Store is an open key-value store backed by a directory on disk.
 type Store struct {
-	mu sync.Mutex // serializes writers and guards the fields below
+	mu        sync.Mutex // serializes writers and guards the fields below
+	compactMu sync.Mutex // serializes compaction runs
 
+	dir       string
 	wal       *walWriter
 	current   atomic.Pointer[view] // latest committed view; lock-free for readers
 	snapshots atomic.Uint64        // cumulative number of snapshots handed out
+	views     *viewRegistry        // views pinned by open snapshots
 
 	closed atomic.Bool
 }
@@ -42,7 +45,8 @@ type Store struct {
 // Snapshot is a stable read-only view of a store captured at one instant. It
 // owns no store resources and stays usable after the store has been closed.
 type Snapshot struct {
-	v atomic.Pointer[view] // nil once the snapshot is closed
+	v   atomic.Pointer[view] // nil once the snapshot is closed
+	reg *viewRegistry        // shared with the store; outlives it
 }
 
 // Open opens or creates a persistent store in dir. A path that names a
@@ -63,6 +67,13 @@ func Open(dir string) (*Store, error) {
 		}
 	}
 
+	// A compaction that crashed before its atomic rename leaves a scratch
+	// log behind; the old log is still complete, so the scratch is garbage.
+	if err := os.Remove(dir + string(os.PathSeparator) + walCompactName); err != nil &&
+		!errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+
 	latest := make(view)
 	validSize, snapshotCount, err := replayWAL(dir, func(op byte, key string, value []byte) {
 		switch op {
@@ -81,7 +92,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{wal: wal}
+	s := &Store{dir: dir, wal: wal, views: newViewRegistry()}
 	s.snapshots.Store(snapshotCount)
 	s.current.Store(&latest)
 	return s, nil
@@ -172,8 +183,10 @@ func (s *Store) Snapshot() (*Snapshot, error) {
 		s.snapshots.Add(^uint64(0))
 		return nil, err
 	}
-	snap := &Snapshot{}
-	snap.v.Store(s.current.Load())
+	snap := &Snapshot{reg: s.views}
+	ptr := s.current.Load()
+	snap.v.Store(ptr)
+	s.views.add(ptr)
 	return snap, nil
 }
 
@@ -200,7 +213,9 @@ func (s *Snapshot) Get(key string) ([]byte, bool) {
 // Close releases the snapshot's fixed view. Closing more than once is a
 // no-op returning nil.
 func (s *Snapshot) Close() error {
-	s.v.Store(nil)
+	if v := s.v.Swap(nil); v != nil && s.reg != nil {
+		s.reg.remove(v)
+	}
 	return nil
 }
 

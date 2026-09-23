@@ -30,8 +30,13 @@ import (
 //
 // An opMeta record carries no key and an 8-byte little-endian value holding
 // the cumulative number of snapshots handed out so far.
+//
+// Compaction rewrites the whole log through the scratch file: it records
+// only the live keys plus one opMeta, syncs, and atomically renames the
+// scratch over walName, so a crash at any point leaves one complete log.
 const (
-	walName = "wal.log"
+	walName        = "wal.log"
+	walCompactName = "wal.log.tmp" // scratch file a compaction renames over walName
 
 	recordMagic uint32 = 0x534e4150 // "SNAP"
 	opPut       byte   = 1
@@ -66,7 +71,8 @@ func openWALWriter(dir string, replaySize int64) (*walWriter, error) {
 	return &walWriter{f: f, w: bufio.NewWriter(f)}, nil
 }
 
-func (l *walWriter) writeFrame(op byte, key string, value []byte) error {
+// writeRecord buffers one framed record without flushing or syncing.
+func (l *walWriter) writeRecord(op byte, key string, value []byte) error {
 	hdr := make([]byte, frameHeaderSize)
 	binary.LittleEndian.PutUint32(hdr[0:4], recordMagic)
 	hdr[4] = op
@@ -90,7 +96,12 @@ func (l *walWriter) writeFrame(op byte, key string, value []byte) error {
 	}
 	var crcb [crcSize]byte
 	binary.LittleEndian.PutUint32(crcb[:], h.Sum32())
-	if _, err := l.w.Write(crcb[:]); err != nil {
+	_, err := l.w.Write(crcb[:])
+	return err
+}
+
+func (l *walWriter) writeFrame(op byte, key string, value []byte) error {
+	if err := l.writeRecord(op, key, value); err != nil {
 		return err
 	}
 	if err := l.w.Flush(); err != nil {
@@ -123,6 +134,63 @@ func (l *walWriter) appendMeta(snapshotCount uint64) error {
 }
 
 func (l *walWriter) close() error { return l.f.Close() }
+
+// writeCompactedWAL writes a fresh log containing exactly the live view and
+// the cumulative snapshot count into dir's scratch file, forces it to stable
+// storage and returns a writer positioned to keep appending to it. The
+// caller renames the scratch file over the live log; until then the on-disk
+// state is untouched, and any failure removes the scratch file.
+func writeCompactedWAL(dir string, live view, snapshotCount uint64) (*walWriter, string, error) {
+	path := dir + string(os.PathSeparator) + walCompactName
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, "", err
+	}
+	fail := func(err error) (*walWriter, string, error) {
+		f.Close()
+		os.Remove(path)
+		return nil, "", err
+	}
+
+	w := &walWriter{f: f, w: bufio.NewWriter(f)}
+	for k, n := range live {
+		if !n.present {
+			continue // deleted keys leave no trace in the compacted log
+		}
+		if len(k) > maxRecord || len(n.value) > maxRecord {
+			return fail(fmt.Errorf("snapshot: record too large"))
+		}
+		if err := w.writeRecord(opPut, k, n.value); err != nil {
+			return fail(err)
+		}
+	}
+	var meta [metaValueSize]byte
+	binary.LittleEndian.PutUint64(meta[:], snapshotCount)
+	if err := w.writeRecord(opMeta, "", meta[:]); err != nil {
+		return fail(err)
+	}
+	if err := w.w.Flush(); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return fail(err)
+	}
+	return w, path, nil
+}
+
+// syncDir forces a directory's own metadata (a rename that happened inside
+// it) to stable storage.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
 
 // replayWAL applies every complete, intact record in commit order: kv records
 // go to fn, meta records update snapshotCount. It returns the number of bytes
