@@ -32,6 +32,7 @@ type view map[string]*node
 type Store struct {
 	mu sync.Mutex // serializes writers and guards the fields below
 
+	dir       string
 	wal       *walWriter
 	current   atomic.Pointer[view] // latest committed view; lock-free for readers
 	snapshots atomic.Uint64        // cumulative number of snapshots handed out
@@ -63,6 +64,12 @@ func Open(dir string) (*Store, error) {
 		}
 	}
 
+	// A replacement log from a compaction killed before its rename can never
+	// be complete state of record; the old wal.log is. Drop the stale file.
+	if err := removeStaleCompact(dir); err != nil {
+		return nil, err
+	}
+
 	latest := make(view)
 	validSize, snapshotCount, err := replayWAL(dir, func(op byte, key string, value []byte) {
 		switch op {
@@ -81,7 +88,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{wal: wal}
+	s := &Store{dir: dir, wal: wal}
 	s.snapshots.Store(snapshotCount)
 	s.current.Store(&latest)
 	return s, nil
@@ -156,6 +163,61 @@ func (s *Store) deriveView() view {
 		next[k] = v
 	}
 	return next
+}
+
+// Compact reclaims history: values that were overwritten or deleted and are
+// not needed by any open snapshot are dropped from memory and the write-ahead
+// log is atomically rewritten with just the live state, so the directory
+// occupies less space than before whenever reclaimable history existed.
+//
+// Every open snapshot keeps its exact fixed view: its values are untouched
+// and reads before and after compaction return byte-identical results. A
+// process killed at any point during compaction reopens in a complete commit
+// state, with every successful write, deletion and the cumulative snapshot
+// count intact; no intermediate file requires a second compaction to repair.
+//
+// Compact takes no arguments, may be called at any time and serializes with
+// writes, deletes, snapshots, closing and other compactions; concurrent or
+// repeated calls queue and all return nil. Compacting a closed store returns
+// an error wrapping fs.ErrClosed.
+func (s *Store) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return errStoreClosed
+	}
+
+	cur := *s.current.Load()
+	live := make([]kvEntry, 0, len(cur))
+	fresh := make(view, len(cur))
+	for k, n := range cur {
+		if !n.present {
+			continue // deleted: no live value and no version any new view needs
+		}
+		// A single-node history makes the old chain unreachable from the
+		// current view; open snapshots keep pointing at their own views, so
+		// only versions nobody reads become garbage.
+		fresh[k] = &node{value: n.value, present: true}
+		live = append(live, kvEntry{key: k, value: n.value})
+	}
+
+	// The rewrite is crash-atomic: on return either the old log or the fully
+	// built new log is wal.log. Swapping the writer under s.mu means a
+	// concurrent writer cannot straddle the two files. A non-nil nextWAL
+	// means the rename landed even if the final directory sync reported an
+	// error; adopt it (the old file is unlinked) and publish the matching
+	// view, then surface the sync error.
+	nextWAL, compactErr := compactWAL(s.dir, live, s.snapshots.Load())
+	if nextWAL == nil {
+		return compactErr
+	}
+	oldWAL := s.wal
+	s.wal = nextWAL
+	s.current.Store(&fresh)
+	if err := oldWAL.close(); err != nil && compactErr == nil {
+		return err
+	}
+	return compactErr
 }
 
 // Snapshot acquires a stable view. It never observes writes committed after
