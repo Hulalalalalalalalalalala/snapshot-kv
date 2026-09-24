@@ -20,6 +20,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).CommitBatch(ops []BatchOp) error` commits several changes atomically.
 - `(*Store).Snapshot() (*Snapshot, error)` opens a stable view.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
+- `(*Store).Checkpoint() error` freezes the complete committed state for fast reopening.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
 
@@ -112,6 +113,49 @@ return nil; compacting a closed store returns an error satisfying
 the replacement is renamed into place, so the swap also succeeds on
 filesystems that refuse renaming over an open file. Compaction never splits
 or reorders versions that belong to one batch.
+
+### Checkpoints and fast reopen
+
+`Checkpoint` freezes the complete committed state of one instant into one
+self-describing file (`checkpoint` next to `wal.log`): every live key's
+terminal value and commit sequence, the cumulative snapshot count, the commit
+sequence watermark, the byte offset in `wal.log` where later history starts
+and a format version, all protected by a CRC-32. The write-ahead log stays the
+complete record; the checkpoint is only a replay accelerator.
+
+- Reopening first loads the checkpoint and then replays only the log frames
+  after its offset. The resulting state is byte-identical to replaying the
+  whole log: every successful write and delete is present, every batch is
+  visible whole with the last in-batch change to a key winning, and the
+  cumulative snapshot count is intact.
+- A checkpoint that is missing, truncated, fails its checksum, carries an
+  unknown magic or format version, or does not agree with the log is rejected
+  as a whole — never half-loaded — without failing the open. Recovery then
+  falls back to replaying `wal.log` from the beginning, which always restores
+  the complete committed state, and the rejected file is retired so the
+  directory looks exactly like one that never had a checkpoint.
+- Freezing and activating are separate crash-atomic steps: the complete file
+  is written to `checkpoint.tmp` and forced to stable storage, then atomically
+  renamed over any previous checkpoint and the directory forced. A process
+  killed at any point leaves either the old complete checkpoint or the new one
+  beside an intact log; both outcomes reopen to a complete committed state and
+  no directory ever needs another freeze or a compaction to repair it. A
+  leftover `checkpoint.tmp` is stale and removed on the next open.
+- Checkpoints may be taken repeatedly within one run; each new checkpoint
+  replaces the previous file in the rename, so only the newest one keeps
+  occupying directory space.
+- `Checkpoint` serializes with writes, batch commits, snapshot opens, cursor
+  opens and compaction, while lock-free reads keep hitting memory and are not
+  held up by the checkpoint sync. Batches are never split, and history pinned
+  by open snapshots or cursors is untouched (checkpoints freeze terminal
+  state; they reclaim nothing).
+- Compaction rewrites `wal.log`, so it retires any checkpoint first; the next
+  `Checkpoint` recreates one against the rewritten log. Reopening a directory
+  that predates checkpoints works exactly as before, and its first
+  `Checkpoint` upgrades it to the new layout automatically.
+- `Checkpoint` on a closed store returns an error satisfying
+  `errors.Is(err, fs.ErrClosed)`. Empty-key and ordinary file-open behavior,
+  and the `Stats` entry point, are unchanged.
 
 ## Tests
 

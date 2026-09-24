@@ -449,17 +449,41 @@ type keyHistory struct {
 // begin marker, so the whole batch disappears on reopen and no half-batch
 // ever reaches the in-memory state.
 func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64)) (int64, uint64, error) {
-	f, err := os.Open(dir + string(os.PathSeparator) + walName)
+	return replayWALFrom(dir, 0, fn)
+}
+
+// replayWALFrom is replayWAL beginning at byte offset from, which must be a
+// frame boundary (0 replays the whole log, as on a directory with no
+// checkpoint). The returned valid prefix is an absolute file offset, so a torn
+// tail truncates correctly relative to the beginning of the file. An offset
+// past the actual end of the file is an error rather than a silent empty
+// replay: the caller treats that as a rejected checkpoint and falls back to a
+// full replay.
+func replayWALFrom(dir string, from int64, fn func(op byte, key string, value []byte, seq uint64)) (int64, uint64, error) {
+	path := dir + string(os.PathSeparator) + walName
+	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if from != 0 {
+				return 0, 0, fmt.Errorf("snapshot: cannot resume at offset %d without a log", from)
+			}
 			return 0, 0, nil
 		}
 		return 0, 0, err
 	}
 	defer f.Close()
 
+	if info, err := f.Stat(); err != nil {
+		return 0, 0, err
+	} else if from < 0 || from > info.Size() {
+		return 0, 0, fmt.Errorf("snapshot: replay offset %d outside log of %d bytes", from, info.Size())
+	}
+	if _, err := f.Seek(from, io.SeekStart); err != nil {
+		return 0, 0, err
+	}
+
 	r := bufio.NewReader(f)
-	var offset int64
+	var offset int64 = from
 	var snapshotCount uint64
 	hdr := make([]byte, frameHeaderSize)
 
@@ -470,7 +494,10 @@ func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64
 
 	// validPrefix reports where the file must be truncated to. A bad frame
 	// inside a batch invalidates from the batch's begin marker; outside a
-	// batch it invalidates only from that frame.
+	// batch it invalidates only from that frame. A tail that is torn right at
+	// the resume offset invalidates from that offset, which is exactly the
+	// frame boundary the checkpoint froze: the torn commit is discarded just
+	// like a torn tail in a full replay, and the checkpoint stays valid.
 	discard := func(at int64) (int64, uint64, error) {
 		if inBatch {
 			return batchStart, snapshotCount, nil

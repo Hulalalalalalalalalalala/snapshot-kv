@@ -63,8 +63,24 @@ type Store struct {
 	// leader until a known number of batches have coalesced.
 	leaderHook func()
 
+	// Test-only crash windows for Checkpoint, nil in production. When set, it
+	// is invoked after the temp checkpoint has been fully synced
+	// (checkpointTempSynced) and after the atomic rename but before the
+	// directory is forced (checkpointRenamed). Returning true simulates a
+	// process kill at that instant: Checkpoint stops immediately, leaves the
+	// directory exactly as it is and returns errCheckpointInterrupted.
+	checkpointHook func(stage checkpointStage) bool
+
 	closed atomic.Bool
 }
+
+// checkpointStage names one interruptible point of a checkpoint freeze.
+type checkpointStage int
+
+const (
+	checkpointTempSynced checkpointStage = iota // temp durable, rename not done
+	checkpointRenamed                           // rename landed, dir not yet forced
+)
 
 // Snapshot is a stable read-only view of a store captured at one instant. It
 // owns no store resources of its own and stays usable after the store has
@@ -98,7 +114,85 @@ func Open(dir string) (*Store, error) {
 	if err := removeStaleCompact(dir); err != nil {
 		return nil, err
 	}
+	// Likewise, a checkpoint temp from a freeze killed before its rename can
+	// never be a complete checkpoint; the live checkpoint (if any) is.
+	if err := removeStaleCheckpointTemp(dir); err != nil {
+		return nil, err
+	}
 
+	latest, replaySeq, snapshotCount, validSize, err := recoverState(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	wal, err := openWALWriter(dir, validSize)
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Store{dir: dir, wal: wal, cursors: make(map[*Cursor]struct{}), nextSeq: replaySeq}
+	s.snapshots.Store(snapshotCount)
+	s.current.Store(&latest)
+	return s, nil
+}
+
+// recoverState rebuilds the committed state, using a complete checkpoint plus
+// only the log frames that follow it whenever a usable checkpoint exists. A
+// checkpoint that is missing, truncated, corrupt, written by an unknown
+// version, or inconsistent with the log is rejected wholesale — never half
+// applied — and recovery falls back to replaying wal.log from the beginning,
+// which always reconstructs the complete committed state. A directory with no
+// checkpoint therefore reopens exactly as before, and the first checkpoint
+// upgrades it to the checkpoint layout with no separate migration.
+func recoverState(dir string) (view, uint64, uint64, int64, error) {
+	var walSize int64
+	if info, err := os.Stat(dir + string(os.PathSeparator) + walName); err == nil {
+		walSize = info.Size()
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, 0, 0, 0, err
+	}
+
+	cp, _ := loadCheckpoint(dir, walSize)
+	if cp != nil {
+		latest := make(view, len(cp.entries))
+		for i := range cp.entries {
+			e := &cp.entries[i]
+			latest[e.key] = &node{value: cloneBytes(e.value), present: true, seq: e.seq}
+		}
+		var replaySeq = cp.nextSeq
+		validSize, snapshotCount, tailErr := replayWALFrom(dir, cp.walOffset,
+			func(op byte, key string, value []byte, seq uint64) {
+				if seq == 0 {
+					// Defensive: a post-checkpoint tail only ever carries Seq
+					// records, but number any legacy frame in commit order
+					// rather than resetting the watermark.
+					replaySeq++
+					seq = replaySeq
+				} else if seq > replaySeq {
+					replaySeq = seq
+				}
+				switch op {
+				case opPut, opPutSeq:
+					latest[key] = &node{value: cloneBytes(value), present: true, seq: seq, older: latest[key]}
+				case opDelete, opDeleteSeq:
+					latest[key] = &node{present: false, seq: seq, older: latest[key]}
+				}
+			})
+		if tailErr == nil {
+			// Meta frames in the tail carry absolute cumulative counts; absent
+			// any, the checkpoint's frozen count is current.
+			if snapshotCount < cp.snapshotCount {
+				snapshotCount = cp.snapshotCount
+			}
+			return latest, replaySeq, snapshotCount, validSize, nil
+		}
+		// The checkpoint did not pair with a usable tail; fall through and
+		// recover from the log alone.
+	}
+
+	// Full-log recovery. A torn/corrupt WAL still yields its complete
+	// committed prefix here, so this path is always the authoritative
+	// fallback the rejection contract relies on.
 	latest := make(view)
 	var replaySeq uint64
 	validSize, snapshotCount, err := replayWAL(dir, func(op byte, key string, value []byte, seq uint64) {
@@ -118,18 +212,18 @@ func Open(dir string) (*Store, error) {
 		}
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, 0, err
 	}
-
-	wal, err := openWALWriter(dir, validSize)
-	if err != nil {
-		return nil, err
+	// Recovery from the log alone succeeded; a rejected checkpoint can never
+	// accelerate this directory as-is, so retire it. Best effort: a failure
+	// only leaves a harmless file the next open ignores. A directory that
+	// never had a checkpoint takes no extra directory sync here.
+	if rmErr := os.Remove(dir + string(os.PathSeparator) + checkpointName); rmErr == nil {
+		_ = syncDirectory(dir)
+	} else if !errors.Is(rmErr, fs.ErrNotExist) {
+		// Keep the recovered state; leave removal for a later open.
 	}
-
-	s := &Store{dir: dir, wal: wal, cursors: make(map[*Cursor]struct{}), nextSeq: replaySeq}
-	s.snapshots.Store(snapshotCount)
-	s.current.Store(&latest)
-	return s, nil
+	return latest, replaySeq, snapshotCount, validSize, nil
 }
 
 // Put stores value under key. An empty key returns an error wrapping
@@ -540,6 +634,21 @@ func (s *Store) Compact() error {
 	// A non-nil next writer after install means the rename landed even if
 	// the final directory sync reported an error; adopt it (the old file is
 	// unlinked), publish the matching view and surface the sync error.
+	// A checkpoint describes a specific wal.log: its resume offset is a byte
+	// position in that file. The rewrite below replaces wal.log wholesale, so
+	// retire the checkpoint (and sweep a temp left by an interrupted freeze)
+	// durably before touching the log. From this fsync until a later
+	// Checkpoint, the directory carries no checkpoint and reopen simply
+	// replays the complete (old or new) log; a crash at any point therefore
+	// never pairs a checkpoint with a log it does not describe. Compaction
+	// never needs the checkpoint to recover, and the next Checkpoint recreates
+	// one against the rewritten log.
+	if err := removeStaleCheckpointTemp(s.dir); err != nil {
+		return err
+	}
+	if err := deactivateCheckpoint(s.dir); err != nil {
+		return err
+	}
 	if err := buildCompactWAL(s.dir, histories, s.snapshots.Load()); err != nil {
 		return err
 	}
@@ -565,6 +674,57 @@ func (s *Store) Compact() error {
 		s.current.Store(&fresh)
 	}
 	return installErr
+}
+
+// Checkpoint freezes the current complete committed state into the
+// self-describing checkpoint file so the next reopen loads it and replays only
+// the log frames that follow, reaching the exact state a full replay would.
+// The file records every live key's terminal value and commit sequence, the
+// cumulative snapshot count, the sequence watermark, the resume offset in
+// wal.log and a format version, all protected by a checksum.
+//
+// Freezing and activating are separate, crash-atomic steps: the complete
+// checkpoint is written to a temp name and forced to stable storage, only then
+// atomically renamed over any previous checkpoint (whose space is reclaimed in
+// the same rename), and finally the directory entry is forced. A process
+// killed at any point leaves either the previous complete checkpoint or the
+// new one alongside an intact wal.log — never half a checkpoint, and never a
+// state that needs another freeze or compaction to repair; reopening simply
+// takes whichever committed state is on disk.
+//
+// Checkpoint serializes with writes, batches, snapshots, cursor opens,
+// compaction and closing through the same lock, while lock-free readers keep
+// hitting memory and are not held up by the checkpoint sync. Repeated calls
+// keep only the newest checkpoint. On a closed store it returns an error
+// wrapping fs.ErrClosed.
+func (s *Store) Checkpoint() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return errStoreClosed
+	}
+
+	data, err := s.buildCheckpointData()
+	if err != nil {
+		return err
+	}
+	// Phase 1: land the complete new checkpoint durably under the temp name.
+	// Nothing live changes until the rename in phase 2.
+	if err := writeCheckpointTemp(s.dir, data); err != nil {
+		return err
+	}
+	if s.checkpointHook != nil && s.checkpointHook(checkpointTempSynced) {
+		return errCheckpointInterrupted
+	}
+	// Phase 2: switch (atomically replacing and reclaiming any older
+	// checkpoint), then force the directory so the switch survives a crash.
+	if err := renameCheckpoint(s.dir); err != nil {
+		return err
+	}
+	if s.checkpointHook != nil && s.checkpointHook(checkpointRenamed) {
+		return errCheckpointInterrupted
+	}
+	return syncDirectory(s.dir)
 }
 
 // openCursors snapshots the set of currently open cursors. Cursor views and
