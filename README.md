@@ -17,10 +17,41 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Put(key string, value []byte) error` stores a value.
 - `(*Store).Get(key string) ([]byte, bool, error)` reads the latest value.
 - `(*Store).Delete(key string) error` removes a key.
+- `(*Store).CommitBatch(ops []BatchOp) error` commits several changes atomically.
 - `(*Store).Snapshot() (*Snapshot, error)` opens a stable view.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
+
+### Atomic batches
+
+`CommitBatch` applies several writes and deletes as one commit. A `BatchOp`
+is `{Key string, Value []byte, Delete bool}`: `Delete: false` stores `Value`
+under `Key` (a nil or empty value is still a hit, exactly as with `Put`),
+`Delete: true` removes `Key`.
+
+- Changes are applied in list order; within one batch a later change to the
+  same key wins (put-then-delete leaves the key deleted; delete-then-put
+  leaves it present).
+- The whole batch becomes visible together or not at all. Every snapshot and
+  every cursor sees either the state before the batch or the state after it,
+  never a mixture. Concurrent batches take effect in commit order and a later
+  batch's same-key change overrides an earlier one's.
+- The batch is forced to stable storage as a single unit before
+  `CommitBatch` returns. Reopening the directory after a crash restores the
+  entire batch or none of it; a half-written batch tail is discarded
+  wholesale, with already-committed batches and the cumulative snapshot
+  count intact.
+- If any op has an empty key, the entire batch is rejected before anything
+  is written: no change becomes visible, no frame lands on disk, and the
+  error satisfies `errors.Is(err, fs.ErrInvalid)`. `CommitBatch` on a closed
+  store satisfies `errors.Is(err, fs.ErrClosed)`.
+- A delete of a key that is absent or already deleted commits nothing, just
+  like `Delete`; a batch containing only such no-ops (or an empty slice)
+  commits nothing and returns nil.
+- `Put` and `Delete` are exactly a one-op batch and keep their behavior.
+- Reads still hit the in-memory view without taking the write lock and are
+  not blocked by the batch syncing to disk.
 
 ### Range scans and paged cursors
 
@@ -77,7 +108,10 @@ fixed view through and after compaction; reopening the directory after a
 crash mid-compaction restores a complete committed state with the cumulative
 snapshot count intact. Repeated or concurrent compactions queue and all
 return nil; compacting a closed store returns an error satisfying
-`errors.Is(err, fs.ErrClosed)`.
+`errors.Is(err, fs.ErrClosed)`. The old write-ahead log is released before
+the replacement is renamed into place, so the swap also succeeds on
+filesystems that refuse renaming over an open file. Compaction never splits
+or reorders versions that belong to one batch.
 
 ## Tests
 

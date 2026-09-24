@@ -21,7 +21,8 @@ import (
 // Frame layout, little-endian:
 //
 //	magic    uint32   recordMagic
-//	op       byte     opPut, opDelete, opMeta, opPutSeq or opDeleteSeq
+//	op       byte     opPut, opDelete, opMeta, opPutSeq, opDeleteSeq,
+//	                  opBatchBegin or opBatchEnd
 //	keyLen   uint32
 //	valLen   uint32
 //	key      [keyLen]byte
@@ -38,6 +39,15 @@ import (
 // and increasing per key) followed, for puts, by the actual value
 // (valLen = 8 + len(value)). Sequence numbers let a pinning compaction merge
 // versions from several eras into one history while keeping their order.
+//
+// A batch is one opBatchBegin marker (empty key, empty value), the Seq frames
+// of its effective changes in list order, and one opBatchEnd marker (empty
+// key, 8-byte value holding the number of inner frames). The markers frame
+// the atomic commit: replay applies the inner frames only once the complete,
+// intact end marker is seen, so a crash that leaves anything short of it
+// discards the whole batch down to the begin offset. The whole frame group
+// is buffered and forced with a single flush plus a single sync, so return
+// from the append means the entire batch is stable.
 const (
 	walName = "wal.log"
 	// compactTmpName holds a freshly built log during compaction; it is
@@ -46,12 +56,14 @@ const (
 	// the next open.
 	compactTmpName = "wal.log.compact"
 
-	recordMagic uint32 = 0x534e4150 // "SNAP"
-	opPut       byte   = 1
-	opDelete    byte   = 2
-	opMeta      byte   = 3
-	opPutSeq    byte   = 4
-	opDeleteSeq byte   = 5
+	recordMagic  uint32 = 0x534e4150 // "SNAP"
+	opPut        byte   = 1
+	opDelete     byte   = 2
+	opMeta       byte   = 3
+	opPutSeq     byte   = 4
+	opDeleteSeq  byte   = 5
+	opBatchBegin byte   = 6
+	opBatchEnd   byte   = 7
 
 	frameHeaderSize = 4 + 1 + 4 + 4
 	crcSize         = 4
@@ -63,6 +75,11 @@ const (
 type walWriter struct {
 	f *os.File
 	w *bufio.Writer
+
+	// syncs counts durable forces (flush + fsync pairs). Groups commit many
+	// batches per increment; it is read by tests while the store lock is
+	// held and otherwise carries no semantics.
+	syncs int
 }
 
 func openWALWriter(dir string, replaySize int64) (*walWriter, error) {
@@ -93,7 +110,11 @@ func (l *walWriter) writeFrame(op byte, key string, value []byte) error {
 	if err := l.w.Flush(); err != nil {
 		return err
 	}
-	return l.f.Sync()
+	if err := l.f.Sync(); err != nil {
+		return err
+	}
+	l.syncs++
+	return nil
 }
 
 // encodeFrame buffers one framed record. Used for ordinary appends (followed
@@ -173,7 +194,11 @@ func (l *walWriter) appendPut(key string, value []byte, seq uint64) error {
 	if err := l.w.Flush(); err != nil {
 		return err
 	}
-	return l.f.Sync()
+	if err := l.f.Sync(); err != nil {
+		return err
+	}
+	l.syncs++
+	return nil
 }
 
 // appendDelete writes and durably commits one tombstone tagged with seq.
@@ -187,7 +212,11 @@ func (l *walWriter) appendDelete(key string, seq uint64) error {
 	if err := l.w.Flush(); err != nil {
 		return err
 	}
-	return l.f.Sync()
+	if err := l.f.Sync(); err != nil {
+		return err
+	}
+	l.syncs++
+	return nil
 }
 
 // appendMeta durably records the cumulative snapshot count.
@@ -195,6 +224,73 @@ func (l *walWriter) appendMeta(snapshotCount uint64) error {
 	var v [metaValueSize]byte
 	binary.LittleEndian.PutUint64(v[:], snapshotCount)
 	return l.writeFrame(opMeta, "", v[:])
+}
+
+// encodeBatch buffers one batch framed by begin/end markers, without
+// flushing or syncing. Every change is a Seq record carrying its own commit
+// sequence; end's value holds the inner-frame count. Several batches encoded
+// back to back can be forced together with one flushSync, which is how
+// concurrent commits share a single disk sync (group commit) while each
+// batch stays a self-contained, independently recoverable framed commit.
+func (l *walWriter) encodeBatch(changes []batchChange) error {
+	var endVal [metaValueSize]byte
+	binary.LittleEndian.PutUint64(endVal[:], uint64(len(changes)))
+	if err := l.encodeFrame(opBatchBegin, "", nil); err != nil {
+		return err
+	}
+	for i := range changes {
+		c := &changes[i]
+		var encErr error
+		if c.delete {
+			encErr = l.encodeFrameSeq(opDeleteSeq, c.key, c.seq, nil)
+		} else {
+			encErr = l.encodeFrameSeq(opPutSeq, c.key, c.seq, c.value)
+		}
+		if encErr != nil {
+			return encErr
+		}
+	}
+	return l.encodeFrame(opBatchEnd, "", endVal[:])
+}
+
+// flushSync forces everything buffered so far to stable storage with one
+// flush and one fsync.
+func (l *walWriter) flushSync() error {
+	if err := l.w.Flush(); err != nil {
+		return err
+	}
+	if err := l.f.Sync(); err != nil {
+		return err
+	}
+	l.syncs++
+	return nil
+}
+
+// position returns the current write offset (logical end of the log). It is
+// only meaningful when no frames are buffered, as at the start of a group.
+func (l *walWriter) position() (int64, error) {
+	return l.f.Seek(0, io.SeekEnd)
+}
+
+// truncateTo rewinds the log to off, dropping anything a failed group
+// buffered or auto-flushed past it, and re-arms the buffered writer.
+func (l *walWriter) truncateTo(off int64) error {
+	l.w.Reset(l.f)
+	if err := l.f.Truncate(off); err != nil {
+		return err
+	}
+	_, err := l.f.Seek(off, io.SeekStart)
+	return err
+}
+
+// appendBatch durably commits one standalone batch: encode and force with a
+// single sync. Group leaders use encodeBatch plus flushSync directly so one
+// sync can cover multiple batches.
+func (l *walWriter) appendBatch(changes []batchChange) error {
+	if err := l.encodeBatch(changes); err != nil {
+		return err
+	}
+	return l.flushSync()
 }
 
 func (l *walWriter) close() error { return l.f.Close() }
@@ -220,25 +316,33 @@ func removeStaleCompact(dir string) error {
 	return nil
 }
 
-// compactWAL atomically replaces the write-ahead log with one containing only
-// the given live values, followed by one meta record with snapshotCount. It
-// builds the complete replacement in compactTmpName, forces it to stable
-// storage, then atomically renames it over wal.log and forces the directory.
-// A crash at any point therefore leaves either the old log or the complete
-// new log: never a truncated or half-written file. On success it returns a
-// fresh writer positioned at the end of the new log. If the directory sync
-// fails the rename has still happened, so a non-nil writer is returned
-// together with the error: the caller must adopt it rather than keep writing
-// to the old, now-unlinked file.
-func compactWAL(dir string, histories []keyHistory, snapshotCount uint64) (*walWriter, error) {
+// batchChange is one effective change in a batch commit.
+type batchChange struct {
+	key    string
+	value  []byte // put payload; ignored when delete is true
+	seq    uint64
+	delete bool
+}
+
+// buildCompactWAL writes the complete replacement log to compactTmpName and
+// durably closes it, without touching wal.log or the live writer. It builds
+// the complete replacement in compactTmpName and forces it to stable
+// storage, so a crash at any point leaves either the old log untouched or a
+// fully built temp that open-time cleanup discards.
+func buildCompactWAL(dir string, histories []keyHistory, snapshotCount uint64) error {
 	if err := removeStaleCompact(dir); err != nil {
-		return nil, err
+		return err
 	}
 
 	path := dir + string(os.PathSeparator)
 	tmp, err := os.OpenFile(path+compactTmpName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	fail := func(err error) error {
+		tmp.Close()
+		os.Remove(path + compactTmpName)
+		return err
 	}
 	l := &walWriter{f: tmp, w: bufio.NewWriter(tmp)}
 	for i := range histories {
@@ -250,15 +354,11 @@ func compactWAL(dir string, histories []keyHistory, snapshotCount uint64) (*walW
 		for _, ver := range histories[i].versions {
 			if ver.present {
 				if err := l.encodeFrameSeq(opPutSeq, histories[i].key, ver.seq, ver.value); err != nil {
-					tmp.Close()
-					os.Remove(path + compactTmpName)
-					return nil, err
+					return fail(err)
 				}
 			} else {
 				if err := l.encodeFrameSeq(opDeleteSeq, histories[i].key, ver.seq, nil); err != nil {
-					tmp.Close()
-					os.Remove(path + compactTmpName)
-					return nil, err
+					return fail(err)
 				}
 			}
 		}
@@ -269,29 +369,46 @@ func compactWAL(dir string, histories []keyHistory, snapshotCount uint64) (*walW
 		var v [metaValueSize]byte
 		binary.LittleEndian.PutUint64(v[:], snapshotCount)
 		if err := l.encodeFrame(opMeta, "", v[:]); err != nil {
-			tmp.Close()
-			os.Remove(path + compactTmpName)
-			return nil, err
+			return fail(err)
 		}
 	}
 	if err := l.w.Flush(); err != nil {
-		tmp.Close()
-		os.Remove(path + compactTmpName)
-		return nil, err
+		return fail(err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(path + compactTmpName)
-		return nil, err
+		return fail(err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(path + compactTmpName)
-		return nil, err
+		return err
 	}
+	return nil
+}
 
-	if err := os.Rename(path+compactTmpName, path+walName); err != nil {
+// installCompactWAL atomically puts a previously built replacement log in
+// place. The live writer must already have been closed by the caller:
+// renaming over wal.log while a writer still holds it open fails on native
+// filesystems that refuse a rename onto an open file, so releasing the old
+// file first is what makes the swap succeed everywhere.
+//
+// renamed reports whether the rename landed. A crash between rename and the
+// directory sync is still safe: on reopen wal.log is either the old or the
+// complete new log, never a half-written file. When the rename fails the old
+// log is intact and is reopened; the returned writer then points at it. When
+// the rename landed but a writer cannot be opened on the new log, a nil
+// writer is returned and the caller must treat the store as failed.
+func installCompactWAL(dir string) (w *walWriter, renamed bool, err error) {
+	path := dir + string(os.PathSeparator)
+	if rerr := os.Rename(path+compactTmpName, path+walName); rerr != nil {
+		// The old log never moved; drop the staged temp so the directory is
+		// left with no intermediate state, then reopen the old log so
+		// committing can continue without needing a second compaction.
 		os.Remove(path + compactTmpName)
-		return nil, err
+		old, openErr := openWALWriter(dir, -1)
+		if openErr != nil {
+			return nil, false, errors.Join(rerr, openErr)
+		}
+		return old, false, rerr
 	}
 	// Make the rename durable; otherwise a crash could expose the old log
 	// even though the new one was fully written. The rename itself has
@@ -300,10 +417,9 @@ func compactWAL(dir string, histories []keyHistory, snapshotCount uint64) (*walW
 	syncErr := syncDirectory(dir)
 	next, openErr := openWALWriter(dir, -1)
 	if openErr != nil {
-		// Join collapses to whichever error is set (or both, if both).
-		return nil, errors.Join(syncErr, openErr)
+		return nil, true, errors.Join(syncErr, openErr)
 	}
-	return next, syncErr
+	return next, true, syncErr
 }
 
 // nodeVer is one retained version of a key.
@@ -325,6 +441,13 @@ type keyHistory struct {
 // predate sequence numbers); meta records update snapshotCount. It returns
 // the number of bytes occupied by the valid prefix; anything after it is a
 // torn or corrupt tail discarded on the next open.
+//
+// Framed batches are applied atomically: their inner records are buffered
+// until the intact end marker and only then handed to fn in list order. A
+// torn or corrupt frame anywhere between begin and end (including a missing
+// or count-mismatched end marker) makes the valid prefix end before the
+// begin marker, so the whole batch disappears on reopen and no half-batch
+// ever reaches the in-memory state.
 func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64)) (int64, uint64, error) {
 	f, err := os.Open(dir + string(os.PathSeparator) + walName)
 	if err != nil {
@@ -340,11 +463,26 @@ func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64
 	var snapshotCount uint64
 	hdr := make([]byte, frameHeaderSize)
 
+	// Batch framing state.
+	inBatch := false
+	batchStart := int64(0) // offset of the batch's begin frame
+	var pending []replayedFrame
+
+	// validPrefix reports where the file must be truncated to. A bad frame
+	// inside a batch invalidates from the batch's begin marker; outside a
+	// batch it invalidates only from that frame.
+	discard := func(at int64) (int64, uint64, error) {
+		if inBatch {
+			return batchStart, snapshotCount, nil
+		}
+		return at, snapshotCount, nil
+	}
+
 	for {
 		start := offset
 		if _, err := io.ReadFull(r, hdr); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return start, snapshotCount, nil // absent/torn tail: valid prefix ends here
+				return discard(start) // absent/torn tail: valid prefix ends here
 			}
 			return 0, 0, err
 		}
@@ -356,24 +494,27 @@ func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64
 		valLen := binary.LittleEndian.Uint32(hdr[9:13])
 		if magic != recordMagic ||
 			(op != opPut && op != opDelete && op != opMeta &&
-				op != opPutSeq && op != opDeleteSeq) ||
+				op != opPutSeq && op != opDeleteSeq &&
+				op != opBatchBegin && op != opBatchEnd) ||
 			keyLen > maxRecord || valLen > maxRecord ||
 			(op == opDelete && valLen != 0) ||
 			(op == opPutSeq && valLen < seqSize) ||
 			(op == opDeleteSeq && valLen != seqSize) ||
-			(op == opMeta && (keyLen != 0 || valLen != metaValueSize)) {
-			return start, snapshotCount, nil // corrupt frame: valid prefix ends here
+			(op == opMeta && (keyLen != 0 || valLen != metaValueSize)) ||
+			(op == opBatchBegin && (keyLen != 0 || valLen != 0)) ||
+			(op == opBatchEnd && (keyLen != 0 || valLen != metaValueSize)) {
+			return discard(start) // corrupt frame: valid prefix ends here
 		}
 
 		body := make([]byte, int(keyLen)+int(valLen))
 		if _, err := io.ReadFull(r, body); err != nil {
-			return start, snapshotCount, nil
+			return discard(start)
 		}
 		offset += int64(len(body))
 
 		var crcb [crcSize]byte
 		if _, err := io.ReadFull(r, crcb[:]); err != nil {
-			return start, snapshotCount, nil
+			return discard(start)
 		}
 		offset += crcSize
 
@@ -381,25 +522,70 @@ func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64
 		h.Write(hdr)
 		h.Write(body)
 		if binary.LittleEndian.Uint32(crcb[:]) != h.Sum32() {
-			return start, snapshotCount, nil
+			return discard(start)
 		}
 
 		switch op {
+		case opBatchBegin:
+			if inBatch {
+				return batchStart, snapshotCount, nil // nested begin: corrupt batch
+			}
+			inBatch = true
+			batchStart = start
+			pending = pending[:0]
+		case opBatchEnd:
+			count := binary.LittleEndian.Uint64(body)
+			if !inBatch || count != uint64(len(pending)) {
+				// Stray end, or an end whose count does not match the
+				// buffered inner frames: the framed commit is not intact.
+				return discard(start)
+			}
+			for _, fr := range pending {
+				fn(fr.op, fr.key, fr.value, fr.seq)
+			}
+			pending = pending[:0]
+			inBatch = false
 		case opPut:
-			key := string(body[:keyLen])
-			fn(opPut, key, body[keyLen:], 0)
+			if inBatch {
+				return batchStart, snapshotCount, nil // only Seq frames may batch
+			}
+			fn(opPut, string(body[:keyLen]), body[keyLen:], 0)
 		case opDelete:
+			if inBatch {
+				return batchStart, snapshotCount, nil
+			}
 			fn(opDelete, string(body[:keyLen]), nil, 0)
 		case opPutSeq:
 			key := string(body[:keyLen])
 			seq := binary.LittleEndian.Uint64(body[keyLen : keyLen+seqSize])
-			fn(opPutSeq, key, body[keyLen+seqSize:], seq)
+			value := body[keyLen+seqSize:]
+			if inBatch {
+				pending = append(pending, replayedFrame{opPutSeq, key, value, seq})
+			} else {
+				fn(opPutSeq, key, value, seq)
+			}
 		case opDeleteSeq:
 			key := string(body[:keyLen])
 			seq := binary.LittleEndian.Uint64(body[keyLen : keyLen+seqSize])
-			fn(opDeleteSeq, key, nil, seq)
+			if inBatch {
+				pending = append(pending, replayedFrame{opDeleteSeq, key, nil, seq})
+			} else {
+				fn(opDeleteSeq, key, nil, seq)
+			}
 		case opMeta:
+			if inBatch {
+				return batchStart, snapshotCount, nil // meta may not ride inside a batch
+			}
 			snapshotCount = binary.LittleEndian.Uint64(body)
 		}
 	}
+}
+
+// replayedFrame is one inner batch frame held during replay until its batch's
+// end marker proves the commit is complete.
+type replayedFrame struct {
+	op    byte
+	key   string
+	value []byte
+	seq   uint64
 }

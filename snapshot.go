@@ -6,6 +6,7 @@ package snapshot
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"sort"
@@ -47,6 +48,20 @@ type Store struct {
 	// open/close, using cursorMu; reads never take either lock.
 	cursorMu sync.Mutex
 	cursors  map[*Cursor]struct{}
+
+	// Group-commit queue. Batches that arrive while another commit is
+	// forcing the log line up here; one leader drains the queue, encodes the
+	// waiting batches and shares a single flush plus fsync across them.
+	// queueMu only ever guards this queue and committer; it is never held
+	// across disk I/O, so readers and enqueuers never wait on a sync.
+	queueMu   sync.Mutex
+	queue     []*pendingBatch
+	committer bool
+
+	// Test hook, nil outside tests. leaderHook runs once after a batch has
+	// become leader, before its first queue drain, and lets tests hold a
+	// leader until a known number of batches have coalesced.
+	leaderHook func()
 
 	closed atomic.Bool
 }
@@ -137,6 +152,232 @@ func (s *Store) Put(key string, value []byte) error {
 	next := s.deriveView()
 	next[key] = &node{value: cloneBytes(value), present: true, seq: seq, older: (*s.current.Load())[key]}
 	s.current.Store(&next)
+	return nil
+}
+
+type pendingBatch struct {
+	ops  []BatchOp
+	done chan error // buffered(1); the leader delivers the commit result
+}
+
+// commitPlan is one queued batch resolved against the cumulative state built
+// up across its whole sync group.
+type commitPlan struct {
+	view view // cumulative view after this batch; nil when it committed nothing
+}
+
+// BatchOp is one change in a batch committed with CommitBatch. Delete false
+// stores Value under Key (a nil or empty Value is still a hit); Delete true
+// removes Key.
+type BatchOp struct {
+	Key    string
+	Value  []byte
+	Delete bool
+}
+
+// CommitBatch applies a group of writes and deletes as one atomic commit:
+// the whole batch becomes visible together or not at all, and snapshots and
+// cursors fixed at any instant see either the state before the batch or the
+// state after it, never an in-between mixture. Changes are applied in list
+// order; a later change to the same key overrides an earlier one within the
+// batch. Concurrent batches take effect in commit (enqueue) order, and a
+// later committed batch's same-key change overrides an earlier one's.
+//
+// Batches committed concurrently share the disk sync: one leader drains the
+// queue, encodes every waiting batch as its own recoverable framed commit
+// and forces them all with one flush plus fsync, so N batches arriving
+// together cost one sync while each stays whole on recovery; a batch that
+// arrives while a sync is in flight rides the next one. Reads take none of
+// these locks and are never blocked by the sync.
+//
+// If any change has an empty key the whole batch is rejected before it is
+// queued or committed: an error wrapping fs.ErrInvalid is returned, no frame
+// is written and the store's state is unchanged. A delete of a key that is
+// absent or already deleted commits nothing, exactly like Delete; a batch
+// containing only such no-ops (or an empty slice) commits nothing and
+// returns nil. CommitBatch on a closed store returns an error wrapping
+// fs.ErrClosed.
+//
+// Each batch is forced to stable storage before its call returns and is
+// published as one new view; a process killed mid-commit therefore reopens
+// with the entire batch present or entirely absent. The store does not keep
+// references to the op Value slices after return.
+func (s *Store) CommitBatch(ops []BatchOp) error {
+	if s.closed.Load() {
+		return errStoreClosed
+	}
+	if err := validateBatchOps(ops); err != nil {
+		return err
+	}
+
+	me := &pendingBatch{ops: ops, done: make(chan error, 1)}
+
+	// Enqueue. queueMu guards only the queue and the leader flag and is
+	// never held across disk I/O, so followers can join a group while the
+	// leader is syncing and readers never wait.
+	s.queueMu.Lock()
+	if s.closed.Load() {
+		s.queueMu.Unlock()
+		return errStoreClosed
+	}
+	s.queue = append(s.queue, me)
+	if s.committer {
+		s.queueMu.Unlock()
+		return <-me.done // the running leader will drain this batch
+	}
+	s.committer = true
+	s.queueMu.Unlock()
+
+	// Test-only rendezvous: invoked once by the elected leader before its
+	// first queue drain. Production leaves it nil.
+	if s.leaderHook != nil {
+		s.leaderHook()
+	}
+
+	// Leadership: drain groups until the queue is empty. Each group takes
+	// s.mu while it forces the log, which serializes it with Put, Delete,
+	// Snapshot, Compact and Close, so a group never straddles a log swap.
+	for {
+		s.queueMu.Lock()
+		// Resign and re-check the queue under one critical section, so a
+		// batch enqueuing in this instant either observes the still-active
+		// leader or becomes the next one; no batch can be left queued with
+		// no leader to drain it.
+		if len(s.queue) == 0 {
+			s.committer = false
+			s.queueMu.Unlock()
+			break
+		}
+		group := s.queue
+		s.queue = nil
+		s.queueMu.Unlock()
+		for p, err := range s.commitGroup(group) {
+			group[p].done <- err
+		}
+	}
+
+	return <-me.done
+}
+
+// validateBatchOps checks argument-only invariants before a batch is queued.
+// Empty keys map to fs.ErrInvalid, exactly as for Put and Delete.
+func validateBatchOps(ops []BatchOp) error {
+	for i := range ops {
+		if ops[i].Key == "" {
+			return errEmptyKey
+		}
+	}
+	for i := range ops {
+		if len(ops[i].Key) > maxRecord || (!ops[i].Delete && seqSize+len(ops[i].Value) > maxRecord) {
+			return fmt.Errorf("snapshot: record too large")
+		}
+	}
+	return nil
+}
+
+// commitGroup encodes and forces every queued batch with one flush and one
+// sync, then publishes one view per effective batch in queue (commit) order.
+// It returns one result per batch. An encoding or sync failure fails the
+// whole group: nothing it contained is published or sequenced. The single
+// committer calls this; s.mu is taken for the entire force, exactly as the
+// single-key commit path does.
+func (s *Store) commitGroup(group []*pendingBatch) []error {
+	results := make([]error, len(group))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() || s.wal == nil {
+		// Close ran between the drain and the lock; nothing can commit.
+		for i := range results {
+			results[i] = errStoreClosed
+		}
+		return results
+	}
+
+	// Remember where the group starts so any failure can rewind the log:
+	// unacknowledged frames must not linger at EOF and reappear under a
+	// later commit or after a reopen. Nothing is buffered here (the previous
+	// group always flushed), so EOF is the exact offset.
+	groupStart, posErr := s.wal.position()
+	if posErr != nil {
+		for i := range results {
+			results[i] = posErr
+		}
+		return results
+	}
+	rollback := func(cause error) []error {
+		if err := s.wal.truncateTo(groupStart); err != nil {
+			cause = errors.Join(cause, err)
+		}
+		for i := range results {
+			results[i] = cause
+		}
+		return results
+	}
+
+	next := *s.current.Load()
+	seq := s.nextSeq
+	plans := make([]commitPlan, 0, len(group))
+	encodedAny := false
+
+	for _, p := range group {
+		// Each batch gets its own cumulative, immutable map, so the view it
+		// publishes is a valid point-in-time state independent of later
+		// batches in the group.
+		view := make(view, len(next)+len(p.ops))
+		for k, v := range next {
+			view[k] = v
+		}
+		var changes []batchChange
+		for i := range p.ops {
+			op := &p.ops[i]
+			head := view[op.Key]
+			if op.Delete {
+				if head == nil || !head.present {
+					continue // idempotent no-op, matching the single Delete
+				}
+				seq++
+				changes = append(changes, batchChange{key: op.Key, seq: seq, delete: true})
+				view[op.Key] = &node{present: false, seq: seq, older: head}
+			} else {
+				seq++
+				value := cloneBytes(op.Value)
+				changes = append(changes, batchChange{key: op.Key, seq: seq, value: value})
+				view[op.Key] = &node{value: value, present: true, seq: seq, older: head}
+			}
+		}
+		if len(changes) > 0 {
+			if err := s.wal.encodeBatch(changes); err != nil {
+				return rollback(err)
+			}
+			encodedAny = true
+		}
+		plans = append(plans, commitPlan{view: ternaryView(len(changes) > 0, view)})
+		next = view
+	}
+
+	if encodedAny {
+		// One flush, one fsync for the whole group. Return means every
+		// encoded batch in it is durable as a self-contained framed commit.
+		if err := s.wal.flushSync(); err != nil {
+			return rollback(err)
+		}
+	}
+
+	s.nextSeq = seq
+	for _, plan := range plans {
+		if plan.view != nil {
+			s.current.Store(&plan.view)
+		}
+	}
+	return results
+}
+
+// ternaryView returns v when ok, nil otherwise.
+func ternaryView(ok bool, v view) view {
+	if ok {
+		return v
+	}
 	return nil
 }
 
@@ -284,23 +525,46 @@ func (s *Store) Compact() error {
 		}
 	}
 
-	// The rewrite is crash-atomic: on return either the old log or the fully
-	// built new log is wal.log. Swapping the writer under s.mu means a
-	// concurrent writer cannot straddle the two files. A non-nil nextWAL
-	// means the rename landed even if the final directory sync reported an
-	// error; adopt it (the old file is unlinked) and publish the matching
-	// view, then surface the sync error.
-	nextWAL, compactErr := compactWAL(s.dir, histories, s.snapshots.Load())
-	if nextWAL == nil {
-		return compactErr
-	}
-	oldWAL := s.wal
-	s.wal = nextWAL
-	s.current.Store(&fresh)
-	if err := oldWAL.close(); err != nil && compactErr == nil {
+	// The rewrite is crash-atomic and split into three phases so the live
+	// writer never holds the old wal.log open while it is being replaced:
+	//
+	//  1. build and sync the complete replacement in the temp name (the old
+	//     log and writer are untouched until this succeeds);
+	//  2. close the live writer so no descriptor occupies wal.log (renaming
+	//     over a still-open file is refused by some native filesystems);
+	//  3. atomically rename the temp over wal.log, force the directory and
+	//     open a writer on the new log.
+	//
+	// A failure before the rename leaves the old log and the store exactly
+	// as they were, so committing can continue and a later Compact retries.
+	// A non-nil next writer after install means the rename landed even if
+	// the final directory sync reported an error; adopt it (the old file is
+	// unlinked), publish the matching view and surface the sync error.
+	if err := buildCompactWAL(s.dir, histories, s.snapshots.Load()); err != nil {
 		return err
 	}
-	return compactErr
+	oldWAL := s.wal
+	if err := oldWAL.close(); err != nil {
+		// The replacement is still staged under the temp name and has not
+		// become state of record; remove it so no repair-only intermediate
+		// file lingers, then reopen a writer on the untouched old log.
+		removeStaleCompact(s.dir)
+		reopened, openErr := openWALWriter(s.dir, -1)
+		if openErr != nil {
+			return err // reopen itself failed; surface the close failure
+		}
+		s.wal = reopened
+		return err
+	}
+	nextWAL, renamed, installErr := installCompactWAL(s.dir)
+	if nextWAL == nil {
+		return installErr
+	}
+	s.wal = nextWAL
+	if renamed {
+		s.current.Store(&fresh)
+	}
+	return installErr
 }
 
 // openCursors snapshots the set of currently open cursors. Cursor views and
