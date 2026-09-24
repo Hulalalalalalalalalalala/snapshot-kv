@@ -116,34 +116,53 @@ or reorders versions that belong to one batch.
 
 ### Checkpoints and fast reopen
 
-`Checkpoint` freezes the store's complete committed state into one
-self-describing file (`snapshot.ckpt`) so reopening is cheap: the checkpoint
-is loaded into memory and only the write-ahead log written *after* it is
-replayed, instead of replaying the whole log. The resulting state is
-byte-for-byte the same as a full log replay — every successful write and
-delete, the atomicity and within-batch last-write-wins ordering of batches,
-and the cumulative snapshot count are all preserved.
+`Checkpoint` freezes the store's complete committed state into a chain of
+self-describing checksummed layers so reopening is cheap: the layers are
+loaded into memory in generation order and only the write-ahead log written
+*after* the newest layer is replayed, instead of replaying the whole log.
+The recovered state is byte-for-byte the same as a full log replay; every
+successful write and delete, the atomicity and within-batch last-write-wins
+ordering of batches, and the cumulative snapshot count are all preserved.
 
-The file carries the terminal key/value state (empty values stay hits,
-deletions are tombstones), the highest commit-sequence watermark, the
-cumulative snapshot count and a format version, all protected by a CRC-32.
-It is an all-or-nothing artifact: built under a temporary name, forced whole
-with one fsync, then atomically renamed into place. On reopen a missing,
-truncated, checksum-bad or unknown-version checkpoint is rejected as a whole
-— half a checkpoint is never installed. Rejection is not an error: recovery
-silently falls back to the log-only reopen path and replays the write-ahead
-log in full, and the rejected file is removed.
+The first layer (generation `0`, the *base*) holds the complete terminal
+state (empty values stay hits, deletions are tombstones). Each later layer is
+a *delta* covering only the commits after the preceding layer: the terminal
+put or tombstone of every key changed in that span. Every layer is
+self-describing: it carries a format version, its generation number, the
+commit-sequence watermark it covers up to, the watermark it starts from, the
+cumulative snapshot count and the corresponding WAL byte offset, all
+protected by a CRC-32. A layer is an all-or-nothing artifact: built under a
+temporary name, forced whole with one fsync, then atomically renamed into
+place.
 
-Producing a checkpoint and making it live are separate, interruptible steps.
-A process killed at any point leaves only the pre-checkpoint state or the
-post-checkpoint state, each a complete committed state recoverable on its
-own; a half-built temporary file is swept on the next open, and no directory
-ever needs a second checkpoint (or any other repair step) before it opens
-normally. The write-ahead log is never modified by a checkpoint, so a
-checkpoint pairs only with the exact log it was taken against; compaction
-(the only log rewrite) durably removes a live checkpoint before swapping the
-log. Checkpoints may be taken repeatedly in one run; each replaces the prior
-file, which then occupies no further space.
+On reopen layers are accepted in generation order starting at the base. A
+missing, truncated, checksum-bad or unknown-version layer, or one whose
+watermarks do not continue the preceding layer's or whose WAL cut no longer
+lies in the current log, is rejected as a whole together with every layer
+above it; recovery falls back to the highest intact layer prefix and replays
+that layer's log tail, or, if the base itself is unusable, to a plain full
+WAL replay. Half a layer is never installed. Rejection is not an error and
+needs no repair: rejected suffix layers are simply removed and the directory
+opens normally.
+
+A bounded retention window keeps reopen cheap and bounds directory space:
+once the live chain reaches a fixed number of generations (`4`), the next
+`Checkpoint` consolidates by atomically swapping in a fresh generation-0 base
+and deleting the entire old chain. Compaction, which rewrites the log,
+retires the whole chain first, because a layer's WAL offset is meaningful
+only against the exact log it was cut against; the layers' space is freed
+immediately and a later checkpoint starts a new chain. Checkpoint space
+therefore tracks live data and the retained window, not cumulative commits.
+
+Producing a layer and making it live are separate, interruptible steps. A
+process killed at any point leaves only a complete earlier generation or a
+complete new one, each a complete committed state recoverable on its own. A
+base consolidation swaps whole layer directories (`ckpt`, with `ckpt.next`
+staging and `ckpt.old` as the displaced chain); reopening finishes or undoes
+an interrupted swap, and a half-built temporary file or directory is swept on
+the next open. No directory ever needs a second checkpoint, a compaction or
+any other repair step before it opens. The write-ahead log is never modified
+by a checkpoint; checkpoints may be taken repeatedly in one run.
 
 `Checkpoint` changes nothing visible. It serializes with writes, batch
 commits, snapshot acquisition, cursor opening and compaction, but never with
@@ -151,9 +170,10 @@ lock-free reads: `Get`, scans, snapshot reads and cursor paging keep hitting
 memory and are not blocked by the checkpoint syncing to disk. It does not
 split a batch or reclaim history that an open snapshot or cursor still
 references. `Checkpoint` on a closed store returns an error satisfying
-`errors.Is(err, fs.ErrClosed)`. A directory written by an older version with
-no checkpoint reopens unchanged and upgrades to the new layout the first
-time a checkpoint is taken.
+`errors.Is(err, fs.ErrClosed)`. A directory written by an older version, with
+the original single-file `snapshot.ckpt` or with no checkpoint at all,
+reopens unchanged and upgrades to the layered layout the first time a
+checkpoint is taken.
 
 ## Tests
 

@@ -43,6 +43,16 @@ type Store struct {
 	snapshots atomic.Uint64        // cumulative number of snapshots handed out
 	nextSeq   uint64               // highest commit sequence handed out; guarded by mu
 
+	// Installed checkpoint-chain state, guarded by mu. A checkpoint is a chain
+	// of self-describing layers: a generation-0 base of complete state plus a
+	// bounded run of delta layers covering later commits. cpHasChain reports
+	// whether a live chain exists; cpGen is its highest layer generation and
+	// cpTipWm that layer's commit watermark. Compaction retires the whole
+	// chain (its cuts pair with the pre-rewrite log only) and clears the flag.
+	cpHasChain bool
+	cpGen      uint64
+	cpTipWm    uint64
+
 	// Open cursors pin their fixed view's versions against compaction. The
 	// set is read by Compact (which holds mu) and mutated at cursor
 	// open/close, using cursorMu; reads never take either lock.
@@ -95,12 +105,13 @@ func Open(dir string) (*Store, error) {
 
 	// A replacement log from a compaction killed before its rename can never
 	// be complete state of record; the old wal.log is. Drop the stale file.
-	// Likewise, a checkpoint temp from a kill mid-checkpoint is staging
-	// debris: only the finished snapshot.ckpt is ever read.
+	// Reconciliation likewise settles an interrupted checkpoint-chain swap
+	// and sweeps half-built layer and single-file temps, so the directory is
+	// immediately usable with no repair step.
 	if err := removeStaleCompact(dir); err != nil {
 		return nil, err
 	}
-	if err := removeStaleCheckpointTmp(dir); err != nil {
+	if err := reconcileLayerDirs(dir); err != nil {
 		return nil, err
 	}
 
@@ -127,45 +138,70 @@ func Open(dir string) (*Store, error) {
 		}
 	}
 
-	// Fast reopen: install a checkpoint's terminal state and replay only the
-	// WAL written after it. A checkpoint is accepted only as a whole; any
-	// defect (missing, truncated, checksum, version, implausible cut) rejects
-	// it wholesale and recovery falls back to a from-scratch WAL replay, the
-	// same path a directory that never had a checkpoint takes.
-	cp, cpOK, cpErr := loadCheckpoint(dir)
-	if cpErr != nil {
-		// Discard the rejected artifact so it neither lingers nor pairs with
-		// a future log; the WAL alone is a complete source of truth.
-		removeRejectedCheckpoint(dir)
-		cpOK = false
+	// Fast reopen: seed memory from the checkpoint chain and replay only the
+	// WAL written after its tip. Layers are accepted only as whole files and
+	// only in an intact generation-0-based chain; a bad layer and everything
+	// above it is withdrawn by the loader and recovery falls back to the
+	// highest intact prefix, or to a from-scratch WAL replay when the base
+	// itself is unusable. A version-1 single-file checkpoint from an older
+	// release is honored only when no layered chain exists.
+	walLen, err := walFileSize(dir)
+	if err != nil {
+		return nil, err
 	}
-	if cpOK {
-		walLen, sizeErr := walFileSize(dir)
-		if sizeErr != nil {
-			return nil, sizeErr
-		}
-		// The cut must lie inside this exact WAL at a frame boundary (the
-		// writer's end-of-log position at capture time). A cut past the end
-		// means the pairing is wrong; refuse rather than punch a hole in the
-		// log or skip records.
-		if cp.offset < 0 || cp.offset > walLen {
-			removeRejectedCheckpoint(dir)
-			cpOK = false
-		}
+
+	var chainTip *v2Header // non-nil when the layered reopen path was taken
+	chain, chainErr := loadLayerChain(dir, walLen)
+	if chainErr != nil {
+		return nil, chainErr
 	}
-	if cpOK {
-		for _, e := range cp.entries {
+	if len(chain) > 0 {
+		base := chain[0]
+		for _, e := range base.full {
 			latest[e.key] = &node{value: cloneBytes(e.value), present: e.present, seq: e.seq}
 		}
-		replaySeq = cp.seq
-		validSize, snapshotCount, err = replayWALTail(dir, cp.offset, cp.snaps, apply)
+		// Delta layers cover only commits after the preceding layer; applying
+		// them in generation order over the base reproduces terminal state.
+		for li := 1; li < len(chain); li++ {
+			for _, e := range chain[li].delta {
+				latest[e.key] = &node{value: cloneBytes(e.value), present: e.present, seq: e.seq}
+			}
+		}
+		tip := chain[len(chain)-1].hdr
+		replaySeq = tip.wm
+		chainTip = &tip
+		validSize, snapshotCount, err = replayWALTail(dir, tip.offset, tip.snaps, apply)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		validSize, snapshotCount, err = replayWAL(dir, apply)
-		if err != nil {
-			return nil, err
+		cp, cpOK, cpErr := loadCheckpointV1(dir)
+		if cpErr != nil {
+			// Discard the rejected artifact so it neither lingers nor pairs
+			// with a future log; the WAL alone is a complete source of truth.
+			removeRejectedV1Checkpoint(dir)
+			cpOK = false
+		}
+		if cpOK && (cp.offset < 0 || cp.offset > walLen) {
+			// The cut must lie inside this exact WAL; refuse a wrong pairing
+			// rather than punch a hole in the log or skip records.
+			removeRejectedV1Checkpoint(dir)
+			cpOK = false
+		}
+		if cpOK {
+			for _, e := range cp.entries {
+				latest[e.key] = &node{value: cloneBytes(e.value), present: e.present, seq: e.seq}
+			}
+			replaySeq = cp.seq
+			validSize, snapshotCount, err = replayWALTail(dir, cp.offset, cp.snaps, apply)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			validSize, snapshotCount, err = replayWAL(dir, apply)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -174,7 +210,14 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{dir: dir, wal: wal, cursors: make(map[*Cursor]struct{}), nextSeq: replaySeq}
+	s := &Store{
+		dir: dir, wal: wal, cursors: make(map[*Cursor]struct{}), nextSeq: replaySeq,
+	}
+	if chainTip != nil {
+		s.cpHasChain = true
+		s.cpGen = chainTip.gen
+		s.cpTipWm = chainTip.wm
+	}
 	s.snapshots.Store(snapshotCount)
 	s.current.Store(&latest)
 	return s, nil
@@ -183,24 +226,34 @@ func Open(dir string) (*Store, error) {
 // Put stores value under key. An empty key returns an error wrapping
 // fs.ErrInvalid. A nil or empty value is stored as-is: a following Get on the
 // key reports a hit. The store does not keep a reference to value.
+//
+// Put is exactly a one-op batch: it joins the same group-commit queue as
+// CommitBatch, so a single write landing while a batch is syncing shares that
+// one disk force instead of serializing a separate fsync behind it. Its
+// atomicity and durability are unchanged.
 func (s *Store) Put(key string, value []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed.Load() {
 		return errStoreClosed
 	}
-	if key == "" {
-		return errEmptyKey
-	}
-	seq := s.nextSeq + 1
-	if err := s.wal.appendPut(key, value, seq); err != nil {
+	op := BatchOp{Key: key, Value: value}
+	if err := validateBatchOps([]BatchOp{op}); err != nil {
 		return err
 	}
-	s.nextSeq = seq
-	next := s.deriveView()
-	next[key] = &node{value: cloneBytes(value), present: true, seq: seq, older: (*s.current.Load())[key]}
-	s.current.Store(&next)
-	return nil
+	return s.commitQueued([]BatchOp{op})
+}
+
+// Delete removes key. Empty keys return an error wrapping fs.ErrInvalid;
+// deleting a key never written or already deleted is not an error and commits
+// nothing. Like Put it rides the shared group-commit queue as a one-op batch.
+func (s *Store) Delete(key string) error {
+	if s.closed.Load() {
+		return errStoreClosed
+	}
+	op := BatchOp{Key: key, Delete: true}
+	if err := validateBatchOps([]BatchOp{op}); err != nil {
+		return err
+	}
+	return s.commitQueued([]BatchOp{op})
 }
 
 type pendingBatch struct {
@@ -208,10 +261,17 @@ type pendingBatch struct {
 	done chan error // buffered(1); the leader delivers the commit result
 }
 
-// commitPlan is one queued batch resolved against the cumulative state built
-// up across its whole sync group.
-type commitPlan struct {
-	view view // cumulative view after this batch; nil when it committed nothing
+// keyedNode is one key's final node produced by a batch, applied to publish
+// that batch's immutable view after the group has been forced.
+type keyedNode struct {
+	key string
+	n   *node
+}
+
+// batchPlan is one queued batch's contribution to publication: the terminal
+// node of each distinct key it touched, or nil when it committed nothing.
+type batchPlan struct {
+	nodes []keyedNode
 }
 
 // BatchOp is one change in a batch committed with CommitBatch. Delete false
@@ -257,7 +317,14 @@ func (s *Store) CommitBatch(ops []BatchOp) error {
 	if err := validateBatchOps(ops); err != nil {
 		return err
 	}
+	return s.commitQueued(ops)
+}
 
+// commitQueued enqueues one already-validated batch and drives the
+// group-commit loop when it wins leadership. Put and Delete are one-op batches
+// and take this same path, so they share a single in-flight disk force with
+// concurrent CommitBatch calls.
+func (s *Store) commitQueued(ops []BatchOp) error {
 	me := &pendingBatch{ops: ops, done: make(chan error, 1)}
 
 	// Enqueue. queueMu guards only the queue and the leader flag and is
@@ -283,8 +350,8 @@ func (s *Store) CommitBatch(ops []BatchOp) error {
 	}
 
 	// Leadership: drain groups until the queue is empty. Each group takes
-	// s.mu while it forces the log, which serializes it with Put, Delete,
-	// Snapshot, Compact and Close, so a group never straddles a log swap.
+	// s.mu while it forces the log, which serializes it with Snapshot,
+	// Compact and Close, so a group never straddles a log swap.
 	for {
 		s.queueMu.Lock()
 		// Resign and re-check the queue under one critical section, so a
@@ -324,11 +391,16 @@ func validateBatchOps(ops []BatchOp) error {
 }
 
 // commitGroup encodes and forces every queued batch with one flush and one
-// sync, then publishes one view per effective batch in queue (commit) order.
-// It returns one result per batch. An encoding or sync failure fails the
-// whole group: nothing it contained is published or sequenced. The single
-// committer calls this; s.mu is taken for the entire force, exactly as the
-// single-key commit path does.
+// sync, then publishes the resulting state. It returns one result per batch.
+// An encoding or sync failure fails the whole group: the log is rewound to
+// the group start and nothing it contained is published or sequenced. The
+// single committer calls this; s.mu is taken for the entire force.
+//
+// Temporary memory while the group is staged and syncing is proportional to
+// the keys the group actually touches, never to the number of live keys:
+// heads resolve against the live view plus a scratch map holding only this
+// group's nodes, and each batch keeps only its distinct-key changes. The one
+// live-sized map is built only after the sync succeeds, to publish.
 func (s *Store) commitGroup(group []*pendingBatch) []error {
 	results := make([]error, len(group))
 
@@ -363,45 +435,55 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 		return results
 	}
 
-	next := *s.current.Load()
+	live := *s.current.Load()
 	seq := s.nextSeq
-	plans := make([]commitPlan, 0, len(group))
+	// groupEdits holds the newest node produced within this group per key, so
+	// later batches and later same-key ops link onto in-group versions
+	// without copying the whole live map. It is the only resolution scratch.
+	groupEdits := make(map[string]*node)
+	plans := make([]batchPlan, 0, len(group))
 	encodedAny := false
 
-	for _, p := range group {
-		// Each batch gets its own cumulative, immutable map, so the view it
-		// publishes is a valid point-in-time state independent of later
-		// batches in the group.
-		view := make(view, len(next)+len(p.ops))
-		for k, v := range next {
-			view[k] = v
+	headOf := func(key string) *node {
+		if n, ok := groupEdits[key]; ok {
+			return n
 		}
+		return live[key]
+	}
+
+	for _, p := range group {
+		plan := batchPlan{}
 		var changes []batchChange
 		for i := range p.ops {
 			op := &p.ops[i]
-			head := view[op.Key]
+			head := headOf(op.Key)
 			if op.Delete {
 				if head == nil || !head.present {
 					continue // idempotent no-op, matching the single Delete
 				}
 				seq++
+				n := &node{present: false, seq: seq, older: head}
 				changes = append(changes, batchChange{key: op.Key, seq: seq, delete: true})
-				view[op.Key] = &node{present: false, seq: seq, older: head}
+				groupEdits[op.Key] = n
+				plan.nodes = append(plan.nodes, keyedNode{key: op.Key, n: n})
 			} else {
 				seq++
 				value := cloneBytes(op.Value)
+				n := &node{value: value, present: true, seq: seq, older: head}
 				changes = append(changes, batchChange{key: op.Key, seq: seq, value: value})
-				view[op.Key] = &node{value: value, present: true, seq: seq, older: head}
+				groupEdits[op.Key] = n
+				plan.nodes = append(plan.nodes, keyedNode{key: op.Key, n: n})
 			}
 		}
 		if len(changes) > 0 {
+			// Every batch keeps its own begin/end framing on disk, so each is
+			// independently whole on recovery even though one sync covers them.
 			if err := s.wal.encodeBatch(changes); err != nil {
 				return rollback(err)
 			}
 			encodedAny = true
 		}
-		plans = append(plans, commitPlan{view: ternaryView(len(changes) > 0, view)})
-		next = view
+		plans = append(plans, plan)
 	}
 
 	if encodedAny {
@@ -413,20 +495,25 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 	}
 
 	s.nextSeq = seq
-	for _, plan := range plans {
-		if plan.view != nil {
-			s.current.Store(&plan.view)
+	if encodedAny {
+		// Publish once: the group was forced as a unit and no snapshot or
+		// cursor can be acquired while s.mu is held, so exposing the
+		// cumulative post-group state atomically gives each batch its
+		// all-or-nothing visibility, in commit order. Nodes keep their full
+		// older chains, so versions pinned just before the group stay
+		// reachable for compaction.
+		next := make(view, len(live)+len(groupEdits))
+		for k, v := range live {
+			next[k] = v
 		}
+		for _, plan := range plans {
+			for _, kn := range plan.nodes {
+				next[kn.key] = kn.n
+			}
+		}
+		s.current.Store(&next)
 	}
 	return results
-}
-
-// ternaryView returns v when ok, nil otherwise.
-func ternaryView(ok bool, v view) view {
-	if ok {
-		return v
-	}
-	return nil
 }
 
 // Get returns the latest committed value for key. Empty keys, keys never
@@ -441,44 +528,6 @@ func (s *Store) Get(key string) ([]byte, bool, error) {
 	}
 	val, ok := lookup(*s.current.Load(), key)
 	return val, ok, nil
-}
-
-// Delete removes key. Deleting an empty key returns an error wrapping
-// fs.ErrInvalid; deleting a key that was never written or is already deleted
-// is not an error and commits nothing.
-func (s *Store) Delete(key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed.Load() {
-		return errStoreClosed
-	}
-	if key == "" {
-		return errEmptyKey
-	}
-	cur := *s.current.Load()
-	if n := cur[key]; n == nil || !n.present {
-		return nil // nothing live to delete: idempotent no-op
-	}
-	seq := s.nextSeq + 1
-	if err := s.wal.appendDelete(key, seq); err != nil {
-		return err
-	}
-	s.nextSeq = seq
-	next := s.deriveView()
-	next[key] = &node{present: false, seq: seq, older: cur[key]}
-	s.current.Store(&next)
-	return nil
-}
-
-// deriveView returns a shallow, mutable copy of the current view. Callers
-// must hold s.mu and publish the result through s.current before unlocking.
-func (s *Store) deriveView() view {
-	cur := *s.current.Load()
-	next := make(view, len(cur)+1)
-	for k, v := range cur {
-		next[k] = v
-	}
-	return next
 }
 
 // Compact reclaims history: values that were overwritten or deleted and are
@@ -591,16 +640,20 @@ func (s *Store) Compact() error {
 	if err := buildCompactWAL(s.dir, histories, s.snapshots.Load()); err != nil {
 		return err
 	}
-	// The replacement must not meet the old checkpoint on reopen: its frames
-	// and offsets are a different log from the one the checkpoint cuts.
-	// Retire the checkpoint durably while the old wal.log is still in place;
-	// a crash after this but before the rename simply replays the old log in
-	// full. Failure here happens before anything stateful moved, so drop the
-	// staged temp and leave the store untouched.
-	if err := retireCheckpoint(s.dir); err != nil {
+	// The replacement must not meet the old checkpoint chain on reopen: its
+	// frames and offsets are a different log from the one the layers cut.
+	// Retire the whole chain (base and every delta, plus staging debris)
+	// durably while the old wal.log is still in place; a crash after this but
+	// before the rename simply replays the old log in full. Failure here
+	// happens before anything stateful moved, so drop the staged temp and
+	// leave the store untouched.
+	if err := retireCheckpointChain(s.dir); err != nil {
 		removeStaleCompact(s.dir)
 		return err
 	}
+	s.cpHasChain = false
+	s.cpGen = 0
+	s.cpTipWm = 0
 	oldWAL := s.wal
 	if err := oldWAL.close(); err != nil {
 		// The replacement is still staged under the temp name and has not
@@ -609,42 +662,67 @@ func (s *Store) Compact() error {
 		removeStaleCompact(s.dir)
 		reopened, openErr := openWALWriter(s.dir, -1)
 		if openErr != nil {
-			return err // reopen itself failed; surface the close failure
+			// The log handle is unusable: rather than leave a store that only
+			// "another Compact" could repair, declare it failed. Every later
+			// operation returns fs.ErrClosed; committed data is intact and a
+			// fresh Open recovers it from the untouched log.
+			s.closed.Store(true)
+			s.wal = nil
+			return errors.Join(err, openErr)
 		}
 		s.wal = reopened
 		return err
 	}
 	nextWAL, renamed, installErr := installCompactWAL(s.dir)
 	if nextWAL == nil {
+		// No writer on either side of the swap. Marking closed is the only
+		// honest state: the directory itself is a complete committed state and
+		// a fresh Open reopens it, but this handle must not claim commits can
+		// continue when they cannot.
+		s.closed.Store(true)
+		s.wal = nil
 		return installErr
 	}
 	s.wal = nextWAL
 	if renamed {
 		s.current.Store(&fresh)
+	} else if installErr != nil {
+		// The rename never landed: the old log is live again and its chain
+		// retirement already happened before this point, so there is no
+		// checkpoint to pair with it. Committing continues; only the fast
+		// reopen shortcut is gone until the next Checkpoint.
+		s.cpHasChain = false
 	}
 	return installErr
 }
 
-// Checkpoint freezes the store's complete committed state into one
-// self-describing, checksummed file so the next Open seeds memory from it and
-// replays only the write-ahead log written afterwards, instead of replaying
-// the whole log. It changes nothing visible: every committed write and
-// deletion, the cumulative snapshot count and every open snapshot or cursor
-// are unaffected, and reads keep hitting memory without touching disk.
+// Checkpoint freezes the store's complete committed state into a chain of
+// self-describing, checksummed layers so the next Open seeds memory from them
+// and replays only the write-ahead log written after the newest layer,
+// instead of replaying the whole log. It changes nothing visible: every
+// committed write and deletion, the cumulative snapshot count and every open
+// snapshot or cursor are unaffected, and reads keep hitting memory without
+// touching disk.
 //
-// Producing a checkpoint and making it live are two distinct steps:
+// The first checkpoint (and the first one after a compaction retired the
+// chain, or after reopening a legacy single-file directory) writes a base
+// layer holding complete state. Each later checkpoint appends one delta
+// layer covering only commits after the preceding layer, which is cheap no
+// matter how large the base is. A bounded retention window keeps the chain
+// short: once the live layers reach checkpointWindow generations the next
+// checkpoint consolidates by atomically swapping in a fresh base and
+// deleting the old chain, and compaction retires the whole chain when it
+// rewrites the log. Directory space therefore tracks live data and the
+// window, never cumulative commits.
 //
-//  1. the full terminal state is captured under the write lock and a
-//     complete file is built under a temporary name and forced to stable
-//     storage;
-//  2. it is atomically renamed over any previous checkpoint and the
-//     directory is forced.
-//
-// The write-ahead log is never modified, so a kill at any instant leaves
-// either the previous complete checkpoint (or none) with the same intact
-// log, or the new complete checkpoint; reopen observes one complete
-// committed state, never a half-installed checkpoint. Repeated checkpoints
-// atomically replace the old file, which then occupies no further space.
+// Producing a layer and making it live are two distinct steps: the complete
+// file is built under a temporary name and forced to stable storage, then
+// atomically renamed (a base swaps whole layer directories) and the
+// directory is forced. A kill at any instant leaves only a complete earlier
+// generation or a complete new one; a half-built temp is swept on the next
+// open, and no directory ever needs a second checkpoint or any other repair
+// before it opens normally. Repeated checkpoints never leave superseded
+// layers occupying space beyond the window.
 //
 // Checkpoint serializes with writes, batch commits, snapshots, cursor opens,
 // compaction and closing (it takes the same write lock), but never with
@@ -663,12 +741,33 @@ func (s *Store) Checkpoint() error {
 	if err != nil {
 		return err
 	}
-	st := captureCheckpoint(*s.current.Load(), uint64(offset), s.nextSeq, s.snapshots.Load())
+	cur := *s.current.Load()
+	wm := s.nextSeq
+	snaps := s.snapshots.Load()
 
-	// Build, force and publish. The WAL and the live state are not touched on
-	// any failure: a leftover temp is staging debris removed on the next open,
-	// and the previous checkpoint (if any) is still intact under its name.
-	return installCheckpoint(s.dir, st)
+	// Consolidate when there is no live chain (first checkpoint, post-compact
+	// reopen, or a legacy v1 directory's first layered checkpoint) or when the
+	// retention window is full; otherwise append one delta layer.
+	consolidate := !s.cpHasChain || s.cpGen+1 >= checkpointWindow
+	if consolidate {
+		hdr, full := captureBase(cur, wm, snaps, offset)
+		if err := installBaseLayer(s.dir, hdr, full); err != nil {
+			return err
+		}
+		s.cpHasChain = true
+		s.cpGen = 0
+		s.cpTipWm = wm
+		return nil
+	}
+
+	gen := s.cpGen + 1
+	hdr, delta := captureDelta(cur, s.cpTipWm, wm, snaps, offset, gen)
+	if err := installDeltaLayer(s.dir, hdr, delta); err != nil {
+		return err
+	}
+	s.cpGen = gen
+	s.cpTipWm = wm
+	return nil
 }
 
 // openCursors snapshots the set of currently open cursors. Cursor views and

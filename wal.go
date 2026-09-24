@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -188,42 +187,6 @@ func (l *walWriter) encodeFrameSeq(op byte, key string, seq uint64, value []byte
 	binary.LittleEndian.PutUint32(crcb[:], h.Sum32())
 	_, err := l.w.Write(crcb[:])
 	return err
-}
-
-// appendPut writes and durably commits one value record tagged with seq.
-func (l *walWriter) appendPut(key string, value []byte, seq uint64) error {
-	if len(key) > maxRecord || seqSize+len(value) > maxRecord {
-		return fmt.Errorf("snapshot: record too large")
-	}
-	if err := l.encodeFrameSeq(opPutSeq, key, seq, value); err != nil {
-		return err
-	}
-	if err := l.w.Flush(); err != nil {
-		return err
-	}
-	if err := l.f.Sync(); err != nil {
-		return err
-	}
-	l.syncs++
-	return nil
-}
-
-// appendDelete writes and durably commits one tombstone tagged with seq.
-func (l *walWriter) appendDelete(key string, seq uint64) error {
-	if len(key) > maxRecord {
-		return fmt.Errorf("snapshot: record too large")
-	}
-	if err := l.encodeFrameSeq(opDeleteSeq, key, seq, nil); err != nil {
-		return err
-	}
-	if err := l.w.Flush(); err != nil {
-		return err
-	}
-	if err := l.f.Sync(); err != nil {
-		return err
-	}
-	l.syncs++
-	return nil
 }
 
 // appendMeta durably records the cumulative snapshot count.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -60,17 +61,71 @@ func exerciseStore(t *testing.T, s *Store, tag string) {
 	}
 }
 
+// checkpointArtifacts returns the checkpoint-related names present in dir:
+// the chain directory and its layer files (flattened as ckpt/<name>), the
+// staging directories, and a legacy single-file checkpoint if present.
+func checkpointArtifacts(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	root := filepath.Join(dir)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		switch e.Name() {
+		case cpDirName, cpNextDir, cpOldDir, checkpointName:
+			out = append(out, e.Name())
+		}
+		if e.Name() == cpDirName && e.IsDir() {
+			layers, err := os.ReadDir(filepath.Join(root, cpDirName))
+			if err != nil {
+				t.Fatalf("read ckpt dir: %v", err)
+			}
+			for _, l := range layers {
+				out = append(out, cpDirName+"/"+l.Name())
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// checkpointExists reports whether a usable live checkpoint artifact exists
+// (a layered chain with at least one layer, or a legacy single file).
 func checkpointExists(t *testing.T, dir string) bool {
 	t.Helper()
-	_, err := os.Stat(filepath.Join(dir, checkpointName))
-	if err == nil {
-		return true
+	for _, n := range checkpointArtifacts(t, dir) {
+		if n == checkpointName || strings.HasPrefix(n, cpDirName+"/"+layerPrefix) {
+			return true
+		}
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return false
-	}
-	t.Fatalf("stat checkpoint: %v", err)
 	return false
+}
+
+// liveLayerPath returns the path of one layer file of the given generation.
+func liveLayerPath(t *testing.T, dir string, gen uint64) string {
+	t.Helper()
+	return filepath.Join(dir, cpDirName, layerName(gen))
+}
+
+// countLayers reports how many layer files the live chain directory holds.
+func countLayers(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, cpDirName))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0
+		}
+		t.Fatalf("read ckpt dir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if _, ok := parseLayerName(e.Name()); ok {
+			n++
+		}
+	}
+	return n
 }
 
 func TestCheckpointReopenMatchesFullReplay(t *testing.T) {
@@ -253,7 +308,7 @@ func TestCheckpointRejectsCorruptAndFallsBack(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			cpPath := filepath.Join(dir, checkpointName)
+			cpPath := liveLayerPath(t, dir, 0)
 			b, err := os.ReadFile(cpPath)
 			if err != nil {
 				t.Fatal(err)
@@ -285,46 +340,39 @@ func TestCheckpointRejectsCorruptAndFallsBack(t *testing.T) {
 	}
 }
 
-func TestCheckpointRepeatedReplacesOldFile(t *testing.T) {
+func TestCheckpointRepeatedBuildsChainAndConsolidatesInWindow(t *testing.T) {
 	dir := tempDir(t)
 	s := openStore(t, dir)
 
-	names := func() []string {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var out []string
-		for _, e := range entries {
-			out = append(out, e.Name())
-		}
-		sort.Strings(out)
-		return out
-	}
-
-	for i := 0; i < 5; i++ {
+	// Two checkpoint calls per round: the first lays the base, subsequent
+	// calls append delta layers until the retention window fills, at which
+	// point a fresh base replaces the whole chain.
+	for i := 0; i < checkpointWindow*2+1; i++ {
 		if err := s.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Checkpoint(); err != nil {
 			t.Fatalf("checkpoint %d: %v", i, err)
 		}
-		got := names()
-		var ckpts int
+		got := checkpointArtifacts(t, dir)
 		for _, n := range got {
-			if n == checkpointName {
-				ckpts++
-			}
-			if n == checkpointTmpName {
-				t.Fatal("checkpoint temp left behind after success")
+			if n == layerTmp || n == cpDirName+"/"+layerTmp ||
+				n == cpNextDir || n == cpOldDir || n == checkpointTmpName {
+				t.Fatalf("iteration %d left staging debris: %v", i, got)
 			}
 		}
-		if ckpts != 1 {
-			t.Fatalf("iteration %d: expected exactly one checkpoint, got %v", i, got)
+		if n := countLayers(t, dir); n < 1 || n > checkpointWindow {
+			t.Fatalf("iteration %d: live layers=%d, want 1..%d", i, n, checkpointWindow)
 		}
 	}
 
-	// Each new checkpoint subsumes all prior history: reopen from the last.
+	// Consolidation never leaves superseded layers beyond the window.
+	if n := countLayers(t, dir); n != 1 {
+		t.Fatalf("chain not consolidated to a fresh base: %d layers", n)
+	}
+
+	// The surviving base holds the complete terminal state, so reopen from
+	// the chain reproduces every committed key.
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -333,10 +381,138 @@ func TestCheckpointRepeatedReplacesOldFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	for i := 0; i < 5; i++ {
+	for i := 0; i < checkpointWindow*2+1; i++ {
 		if got, ok, _ := s2.Get(fmt.Sprintf("k%d", i)); !ok || string(got) != fmt.Sprintf("v%d", i) {
-			t.Fatalf("k%d after repeated checkpoints: %q ok=%v", i, got, ok)
+			t.Fatalf("k%d after chain reopen: %q ok=%v", i, got, ok)
 		}
+	}
+}
+
+func TestCheckpointDeltaLayersAppendAndReopen(t *testing.T) {
+	// Several checkpoints without forcing consolidation produce a base plus
+	// delta layers; reopen loads them in generation order and replays the
+	// trailing tail, byte-for-byte matching a store that only replayed its
+	// WAL.
+	dirFull := tempDir(t)
+	dirChain := tempDir(t)
+	full := openStore(t, dirFull)
+	chain := openStore(t, dirChain)
+
+	commit := func(st *Store, round int) {
+		t.Helper()
+		if err := st.CommitBatch([]BatchOp{
+			{Key: fmt.Sprintf("key%d", round), Value: []byte(fmt.Sprintf("v%d", round))},
+			{Key: "shared", Value: []byte(fmt.Sprintf("round%d", round))},
+			{Key: "gone", Value: []byte("x")},
+			{Key: "gone", Delete: true}, // put-then-delete ends deleted
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Snapshot(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for r := 0; r < checkpointWindow-1; r++ {
+		commit(full, r)
+		commit(chain, r)
+		if err := chain.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Base + (window-2) deltas so far, none consolidated away.
+	if got := countLayers(t, dirChain); got != checkpointWindow-1 {
+		t.Fatalf("layers=%d want %d", got, checkpointWindow-1)
+	}
+	// One more committed batch lands strictly after the newest layer and
+	// must come back solely from the WAL tail replay.
+	commit(full, checkpointWindow-1)
+	commit(chain, checkpointWindow-1)
+	if err := full.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := chain.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reFull := openStore(t, dirFull)
+	defer reFull.Close()
+	reChain, err := Open(dirChain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reChain.Close()
+
+	if a, b := dumpView(t, reFull), dumpView(t, reChain); len(a) != len(b) {
+		t.Fatalf("chain reopen %d pairs, full replay %d", len(b), len(a))
+	} else {
+		for i := range a {
+			if a[i].Key != b[i].Key || string(a[i].Value) != string(b[i].Value) {
+				t.Fatalf("mismatch %d: %q=%q vs %q=%q", i, a[i].Key, a[i].Value, b[i].Key, b[i].Value)
+			}
+		}
+	}
+	if got, ok, _ := reChain.Get("shared"); !ok || string(got) != fmt.Sprintf("round%d", checkpointWindow-1) {
+		t.Fatalf("tail batch not replayed over chain: %q ok=%v", got, ok)
+	}
+	if _, ok, _ := reChain.Get("gone"); ok {
+		t.Fatal("delta tombstone did not shadow base put")
+	}
+	if n := reChain.Stats().Snapshots; n != uint64(checkpointWindow) {
+		t.Fatalf("snapshots across chain: %d want %d", n, checkpointWindow)
+	}
+}
+
+func TestCheckpointBadDeltaRejectsSuffixKeepsPrefix(t *testing.T) {
+	dir := tempDir(t)
+	s := openStore(t, dir)
+	if err := s.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Checkpoint(); err != nil { // base gen0
+		t.Fatal(err)
+	}
+	if err := s.Put("b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Checkpoint(); err != nil { // delta gen1
+		t.Fatal(err)
+	}
+	if err := s.Put("c", []byte("3")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Checkpoint(); err != nil { // delta gen2
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt the middle delta (gen1). Reopen must reject gen1 and gen2,
+	// fall back to the intact base, and replay the WAL tail from its cut so
+	// the final state is still exactly the full committed state.
+	p := liveLayerPath(t, dir, 1)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[len(b)-8] ^= 0x01 // break the CRC
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for k, v := range map[string]string{"a": "1", "b": "2", "c": "3"} {
+		if got, ok, _ := s2.Get(k); !ok || string(got) != v {
+			t.Fatalf("fallback-to-prefix lost %s: %q ok=%v want %s", k, got, ok, v)
+		}
+	}
+	// The rejected suffix was withdrawn; only the base layer remains.
+	if got := countLayers(t, dir); got != 1 {
+		t.Fatalf("rejected suffix not removed: %d layers remain", got)
 	}
 }
 
