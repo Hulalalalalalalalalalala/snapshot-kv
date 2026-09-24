@@ -161,17 +161,21 @@ func removeStaleCompact(dir string) error {
 	return nil
 }
 
-// compactWAL atomically replaces the write-ahead log with one containing only
-// the given live values, followed by one meta record with snapshotCount. It
-// builds the complete replacement in compactTmpName, forces it to stable
-// storage, then atomically renames it over wal.log and forces the directory.
-// A crash at any point therefore leaves either the old log or the complete
-// new log: never a truncated or half-written file. On success it returns a
-// fresh writer positioned at the end of the new log. If the directory sync
-// fails the rename has still happened, so a non-nil writer is returned
-// together with the error: the caller must adopt it rather than keep writing
-// to the old, now-unlinked file.
-func compactWAL(dir string, live []kvEntry, snapshotCount uint64) (*walWriter, error) {
+// compactWAL atomically replaces the write-ahead log with records followed by
+// one meta record carrying snapshotCount. records is the complete, ordered
+// history the new log must retain: versions pinned by open cursors first
+// (oldest to newest per key), then the current view's end state. Replaying
+// the replacement therefore reconstructs exactly the latest view while
+// keeping every cursor-referenced version present in the file. It builds the
+// complete replacement in compactTmpName, forces it to stable storage, then
+// atomically renames it over wal.log and forces the directory. A crash at any
+// point therefore leaves either the old log or the complete new log: never a
+// truncated or half-written file. On success it returns a fresh writer
+// positioned at the end of the new log. If the directory sync fails the
+// rename has still happened, so a non-nil writer is returned together with
+// the error: the caller must adopt it rather than keep writing to the old,
+// now-unlinked file.
+func compactWAL(dir string, records []walRecord, snapshotCount uint64) (*walWriter, error) {
 	if err := removeStaleCompact(dir); err != nil {
 		return nil, err
 	}
@@ -182,13 +186,23 @@ func compactWAL(dir string, live []kvEntry, snapshotCount uint64) (*walWriter, e
 		return nil, err
 	}
 	l := &walWriter{f: tmp, w: bufio.NewWriter(tmp)}
-	for i := range live {
+	writeFail := func() (*walWriter, error) {
+		tmp.Close()
+		os.Remove(path + compactTmpName)
+		return nil, err
+	}
+	for i := range records {
 		// Frames are only buffered here; one flush plus one sync below
 		// commits the whole replacement atomically.
-		if err := l.encodeFrame(opPut, live[i].key, live[i].value); err != nil {
-			tmp.Close()
-			os.Remove(path + compactTmpName)
-			return nil, err
+		rec := records[i]
+		if rec.deleted {
+			if err := l.encodeFrame(opDelete, rec.key, nil); err != nil {
+				return writeFail()
+			}
+		} else {
+			if err := l.encodeFrame(opPut, rec.key, rec.value); err != nil {
+				return writeFail()
+			}
 		}
 	}
 	// A zero count needs no record: replay of an absent meta yields 0. This
@@ -197,20 +211,14 @@ func compactWAL(dir string, live []kvEntry, snapshotCount uint64) (*walWriter, e
 		var v [metaValueSize]byte
 		binary.LittleEndian.PutUint64(v[:], snapshotCount)
 		if err := l.encodeFrame(opMeta, "", v[:]); err != nil {
-			tmp.Close()
-			os.Remove(path + compactTmpName)
-			return nil, err
+			return writeFail()
 		}
 	}
 	if err := l.w.Flush(); err != nil {
-		tmp.Close()
-		os.Remove(path + compactTmpName)
-		return nil, err
+		return writeFail()
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(path + compactTmpName)
-		return nil, err
+		return writeFail()
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(path + compactTmpName)
@@ -234,10 +242,13 @@ func compactWAL(dir string, live []kvEntry, snapshotCount uint64) (*walWriter, e
 	return next, syncErr
 }
 
-// kvEntry is one live key/value pair included in a compacted log.
-type kvEntry struct {
-	key   string
-	value []byte
+// walRecord is one entry of a compaction-rewritten log. deleted selects an
+// opDelete frame; otherwise an opPut frame carries value (which may be
+// empty: an empty stored value is still a present key).
+type walRecord struct {
+	key     string
+	value   []byte
+	deleted bool
 }
 
 // replayWAL applies every complete, intact record in commit order: kv records

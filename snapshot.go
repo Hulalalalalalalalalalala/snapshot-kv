@@ -5,6 +5,7 @@
 package snapshot
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"os"
@@ -35,7 +36,9 @@ type Store struct {
 	dir       string
 	wal       *walWriter
 	current   atomic.Pointer[view] // latest committed view; lock-free for readers
+	viewGen   uint64               // generation of the current view; bumped on each commit
 	snapshots atomic.Uint64        // cumulative number of snapshots handed out
+	pins      pinRegistry          // versions pinned by open cursors; own lock
 
 	closed atomic.Bool
 }
@@ -44,6 +47,16 @@ type Store struct {
 // owns no store resources and stays usable after the store has been closed.
 type Snapshot struct {
 	v atomic.Pointer[view] // nil once the snapshot is closed
+
+	// gen is the view generation this snapshot captured; cursors opened on
+	// it inherit it, so compaction orders retained versions by true view age
+	// even when an old snapshot's cursor outlives a latest-view cursor.
+	gen uint64
+
+	// store back-references the pin registry so a cursor opened on this
+	// snapshot can pin its versions through compaction; nil is impossible for
+	// snapshots handed out by Store, and harmless after the store is gone.
+	store *Store
 }
 
 // Open opens or creates a persistent store in dir. A path that names a
@@ -112,6 +125,7 @@ func (s *Store) Put(key string, value []byte) error {
 	next := s.deriveView()
 	next[key] = &node{value: cloneBytes(value), present: true, older: (*s.current.Load())[key]}
 	s.current.Store(&next)
+	s.viewGen++
 	return nil
 }
 
@@ -151,6 +165,7 @@ func (s *Store) Delete(key string) error {
 	next := s.deriveView()
 	next[key] = &node{present: false, older: cur[key]}
 	s.current.Store(&next)
+	s.viewGen++
 	return nil
 }
 
@@ -188,17 +203,62 @@ func (s *Store) Compact() error {
 	}
 
 	cur := *s.current.Load()
-	live := make([]kvEntry, 0, len(cur))
+	activePins := s.pins.ordered()
+
 	fresh := make(view, len(cur))
 	for k, n := range cur {
-		if !n.present {
-			continue // deleted: no live value and no version any new view needs
+		if n.present {
+			// A single-node history makes the old chain unreachable from the
+			// current view; open snapshots and cursors keep pointing at their
+			// own views, so only versions nobody reads become garbage.
+			fresh[k] = &node{value: n.value, present: true}
 		}
-		// A single-node history makes the old chain unreachable from the
-		// current view; open snapshots keep pointing at their own views, so
-		// only versions nobody reads become garbage.
-		fresh[k] = &node{value: n.value, present: true}
-		live = append(live, kvEntry{key: k, value: n.value})
+	}
+
+	// Build the replacement log's record sequence. Open cursors pin history:
+	// every version their fixed view can read must survive this rewrite, so
+	// walk the pins from the oldest cursor to the newest and emit each pinned
+	// key's value then. Views only move forward, so for any one key the
+	// emitted puts run oldest-to-newest; the current view's end state is
+	// appended last (a tombstone when the key ends deleted). Consecutive
+	// identical puts collapse, and a key the replay would never see needs no
+	// tombstone. After all cursors close, the next compaction writes none of
+	// this history and the directory shrinks.
+	records := make([]walRecord, 0, len(cur))
+	type lastRec struct {
+		put bool
+		val []byte
+	}
+	emitted := make(map[string]lastRec, len(cur))
+	appendPut := func(k string, v []byte) {
+		if r, ok := emitted[k]; ok && r.put && bytes.Equal(r.val, v) {
+			return
+		}
+		records = append(records, walRecord{key: k, value: v})
+		emitted[k] = lastRec{put: true, val: v}
+	}
+	appendDelete := func(k string) {
+		r, seen := emitted[k]
+		if !seen || !r.put {
+			// No earlier put in the replacement log: replay simply ends
+			// with the key absent, exactly as a baseline compaction of
+			// live state did, so no tombstone frame is needed.
+			return
+		}
+		records = append(records, walRecord{key: k, deleted: true})
+		emitted[k] = lastRec{put: false}
+	}
+	for _, p := range activePins {
+		for _, k := range sortedKeysInRange(p.view, p.start, p.end, p.endInclusive) {
+			appendPut(k, p.view[k].value)
+		}
+	}
+	for k, n := range cur {
+		if n.present {
+			appendPut(k, n.value)
+		} else {
+			appendDelete(k)
+		}
 	}
 
 	// The rewrite is crash-atomic: on return either the old log or the fully
@@ -207,13 +267,14 @@ func (s *Store) Compact() error {
 	// means the rename landed even if the final directory sync reported an
 	// error; adopt it (the old file is unlinked) and publish the matching
 	// view, then surface the sync error.
-	nextWAL, compactErr := compactWAL(s.dir, live, s.snapshots.Load())
+	nextWAL, compactErr := compactWAL(s.dir, records, s.snapshots.Load())
 	if nextWAL == nil {
 		return compactErr
 	}
 	oldWAL := s.wal
 	s.wal = nextWAL
 	s.current.Store(&fresh)
+	s.viewGen++
 	if err := oldWAL.close(); err != nil && compactErr == nil {
 		return err
 	}
@@ -234,7 +295,7 @@ func (s *Store) Snapshot() (*Snapshot, error) {
 		s.snapshots.Add(^uint64(0))
 		return nil, err
 	}
-	snap := &Snapshot{}
+	snap := &Snapshot{store: s, gen: s.viewGen}
 	snap.v.Store(s.current.Load())
 	return snap, nil
 }
