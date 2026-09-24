@@ -95,15 +95,24 @@ func Open(dir string) (*Store, error) {
 
 	// A replacement log from a compaction killed before its rename can never
 	// be complete state of record; the old wal.log is. Drop the stale file.
+	// Likewise, a checkpoint temp from a kill mid-checkpoint is staging
+	// debris: only the finished snapshot.ckpt is ever read.
 	if err := removeStaleCompact(dir); err != nil {
+		return nil, err
+	}
+	if err := removeStaleCheckpointTmp(dir); err != nil {
 		return nil, err
 	}
 
 	latest := make(view)
 	var replaySeq uint64
-	validSize, snapshotCount, err := replayWAL(dir, func(op byte, key string, value []byte, seq uint64) {
-		// Legacy records (written before sequence numbers existed) carry no
-		// seq; replay order is commit order, so number them sequentially.
+	var snapshotCount uint64
+	var validSize int64
+
+	// apply installs one replayed record into the latest view. Legacy
+	// records (written before sequence numbers existed) carry no seq; replay
+	// order is commit order, so number them sequentially.
+	apply := func(op byte, key string, value []byte, seq uint64) {
 		if seq == 0 {
 			replaySeq++
 			seq = replaySeq
@@ -116,9 +125,48 @@ func Open(dir string) (*Store, error) {
 		case opDelete, opDeleteSeq:
 			latest[key] = &node{present: false, seq: seq, older: latest[key]}
 		}
-	})
-	if err != nil {
-		return nil, err
+	}
+
+	// Fast reopen: install a checkpoint's terminal state and replay only the
+	// WAL written after it. A checkpoint is accepted only as a whole; any
+	// defect (missing, truncated, checksum, version, implausible cut) rejects
+	// it wholesale and recovery falls back to a from-scratch WAL replay, the
+	// same path a directory that never had a checkpoint takes.
+	cp, cpOK, cpErr := loadCheckpoint(dir)
+	if cpErr != nil {
+		// Discard the rejected artifact so it neither lingers nor pairs with
+		// a future log; the WAL alone is a complete source of truth.
+		removeRejectedCheckpoint(dir)
+		cpOK = false
+	}
+	if cpOK {
+		walLen, sizeErr := walFileSize(dir)
+		if sizeErr != nil {
+			return nil, sizeErr
+		}
+		// The cut must lie inside this exact WAL at a frame boundary (the
+		// writer's end-of-log position at capture time). A cut past the end
+		// means the pairing is wrong; refuse rather than punch a hole in the
+		// log or skip records.
+		if cp.offset < 0 || cp.offset > walLen {
+			removeRejectedCheckpoint(dir)
+			cpOK = false
+		}
+	}
+	if cpOK {
+		for _, e := range cp.entries {
+			latest[e.key] = &node{value: cloneBytes(e.value), present: e.present, seq: e.seq}
+		}
+		replaySeq = cp.seq
+		validSize, snapshotCount, err = replayWALTail(dir, cp.offset, cp.snaps, apply)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		validSize, snapshotCount, err = replayWAL(dir, apply)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	wal, err := openWALWriter(dir, validSize)
@@ -543,6 +591,16 @@ func (s *Store) Compact() error {
 	if err := buildCompactWAL(s.dir, histories, s.snapshots.Load()); err != nil {
 		return err
 	}
+	// The replacement must not meet the old checkpoint on reopen: its frames
+	// and offsets are a different log from the one the checkpoint cuts.
+	// Retire the checkpoint durably while the old wal.log is still in place;
+	// a crash after this but before the rename simply replays the old log in
+	// full. Failure here happens before anything stateful moved, so drop the
+	// staged temp and leave the store untouched.
+	if err := retireCheckpoint(s.dir); err != nil {
+		removeStaleCompact(s.dir)
+		return err
+	}
 	oldWAL := s.wal
 	if err := oldWAL.close(); err != nil {
 		// The replacement is still staged under the temp name and has not
@@ -565,6 +623,52 @@ func (s *Store) Compact() error {
 		s.current.Store(&fresh)
 	}
 	return installErr
+}
+
+// Checkpoint freezes the store's complete committed state into one
+// self-describing, checksummed file so the next Open seeds memory from it and
+// replays only the write-ahead log written afterwards, instead of replaying
+// the whole log. It changes nothing visible: every committed write and
+// deletion, the cumulative snapshot count and every open snapshot or cursor
+// are unaffected, and reads keep hitting memory without touching disk.
+//
+// Producing a checkpoint and making it live are two distinct steps:
+//
+//  1. the full terminal state is captured under the write lock and a
+//     complete file is built under a temporary name and forced to stable
+//     storage;
+//  2. it is atomically renamed over any previous checkpoint and the
+//     directory is forced.
+//
+// The write-ahead log is never modified, so a kill at any instant leaves
+// either the previous complete checkpoint (or none) with the same intact
+// log, or the new complete checkpoint; reopen observes one complete
+// committed state, never a half-installed checkpoint. Repeated checkpoints
+// atomically replace the old file, which then occupies no further space.
+//
+// Checkpoint serializes with writes, batch commits, snapshots, cursor opens,
+// compaction and closing (it takes the same write lock), but never with
+// lock-free reads: Get, scans, snapshot reads and cursor paging proceed while
+// it runs. A batch stays wholly on one side of the captured cut, and history
+// pinned by open snapshots or cursors is left untouched. On a closed store
+// Checkpoint returns an error wrapping fs.ErrClosed.
+func (s *Store) Checkpoint() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return errStoreClosed
+	}
+
+	offset, err := s.wal.position()
+	if err != nil {
+		return err
+	}
+	st := captureCheckpoint(*s.current.Load(), uint64(offset), s.nextSeq, s.snapshots.Load())
+
+	// Build, force and publish. The WAL and the live state are not touched on
+	// any failure: a leftover temp is staging debris removed on the next open,
+	// and the previous checkpoint (if any) is still intact under its name.
+	return installCheckpoint(s.dir, st)
 }
 
 // openCursors snapshots the set of currently open cursors. Cursor views and

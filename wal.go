@@ -32,6 +32,13 @@ import (
 // An opMeta record carries no key and an 8-byte little-endian value holding
 // the cumulative number of snapshots handed out so far.
 //
+// The WAL is never rewritten by a checkpoint (a checkpoint only adds a side
+// file); only compaction replaces wal.log. Compaction durably removes any
+// live checkpoint before renaming the replacement log into place, so after a
+// crash a checkpoint can never be found next to a WAL other than the one it
+// was captured against: the checkpoint and the log it pairs with share a
+// lifetime established by ordered, synced metadata operations.
+//
 // opPut/opDelete are the original records and carry no sequence number; they
 // remain readable forever so a directory written by an older version reopens
 // unchanged. Records written by this version use the Seq variants instead:
@@ -436,6 +443,67 @@ type keyHistory struct {
 	versions []nodeVer
 }
 
+// readFullFrame reads one WAL frame from r. hdr is the reusable frame-header
+// buffer. On a clean end of file it returns cleanEOF=true. Any torn read,
+// unknown op, bad length or checksum mismatch returns n=0 with a nil error
+// for an ordinary corrupt/torn frame (the caller ends the valid prefix
+// before it) or a non-nil error only for an underlying read failure.
+func readFullFrame(r *bufio.Reader, hdr []byte) (op byte, body []byte, frameLen int, cleanEOF bool, err error) {
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			// Exact end of log (EOF) or a partial header of a torn append
+			// (ErrUnexpectedEOF): either way the valid prefix ends here.
+			return 0, nil, 0, true, nil
+		}
+		return 0, nil, 0, false, err
+	}
+	magic := binary.LittleEndian.Uint32(hdr[0:4])
+	op = hdr[4]
+	keyLen := binary.LittleEndian.Uint32(hdr[5:9])
+	valLen := binary.LittleEndian.Uint32(hdr[9:13])
+	if magic != recordMagic ||
+		(op != opPut && op != opDelete && op != opMeta &&
+			op != opPutSeq && op != opDeleteSeq &&
+			op != opBatchBegin && op != opBatchEnd) ||
+		keyLen > maxRecord || valLen > maxRecord ||
+		(op == opDelete && valLen != 0) ||
+		(op == opPutSeq && valLen < seqSize) ||
+		(op == opDeleteSeq && valLen != seqSize) ||
+		(op == opMeta && (keyLen != 0 || valLen != metaValueSize)) ||
+		(op == opBatchBegin && (keyLen != 0 || valLen != 0)) ||
+		(op == opBatchEnd && (keyLen != 0 || valLen != metaValueSize)) {
+		return 0, nil, 0, false, nil // corrupt frame
+	}
+
+	body = make([]byte, int(keyLen)+int(valLen))
+	if _, err := io.ReadFull(r, body); err != nil {
+		return 0, nil, 0, false, nil // torn body
+	}
+	var crcb [crcSize]byte
+	if _, err := io.ReadFull(r, crcb[:]); err != nil {
+		return 0, nil, 0, false, nil // torn checksum
+	}
+	h := crc32.NewIEEE()
+	h.Write(hdr)
+	h.Write(body)
+	if binary.LittleEndian.Uint32(crcb[:]) != h.Sum32() {
+		return 0, nil, 0, false, nil // checksum mismatch
+	}
+	return op, body, frameHeaderSize + len(body) + crcSize, false, nil
+}
+
+// walSize reports the current size of wal.log, or 0 when it is absent.
+func walFileSize(dir string) (int64, error) {
+	info, err := os.Stat(dir + string(os.PathSeparator) + walName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 // replayWAL applies every complete, intact record in commit order. kv
 // records go to fn with their commit sequence (0 for legacy records that
 // predate sequence numbers); meta records update snapshotCount. It returns
@@ -457,15 +525,56 @@ func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64
 		return 0, 0, err
 	}
 	defer f.Close()
+	return replayFrames(f, 0, 0, fn)
+}
 
+// replayWALTail is the checkpoint-reopen path: it seeds nothing itself (the
+// caller has installed the checkpoint state) and replays only the frames at
+// or after start, carrying initialSnap as the starting cumulative snapshot
+// count. A missing WAL is reported as an empty tail ending exactly at start,
+// which is the normal case for a checkpoint taken on an as-yet unwritten
+// store.
+func replayWALTail(dir string, start int64, initialSnap uint64, fn func(op byte, key string, value []byte, seq uint64)) (int64, uint64, error) {
+	f, err := os.Open(dir + string(os.PathSeparator) + walName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return start, initialSnap, nil
+		}
+		return 0, 0, err
+	}
+	defer f.Close()
+	return replayFrames(f, start, initialSnap, fn)
+}
+
+// replayFrames drives the same recovery as replayWAL but starts at byte
+// offset start: a checkpoint reopen seeds memory from the checkpoint and
+// only the WAL tail (frames at or after start) is replayed. start is an
+// exact frame boundary — it was the writer's end-of-log position when the
+// checkpoint was captured, and the capture happens under the same lock that
+// forces each whole append — so the checkpoint-covered prefix is merely
+// skipped, never parsed. initialSnap is the cumulative snapshot count
+// already carried by the checkpoint (0 for a full replay); a meta frame in
+// the tail assigns its absolute count as usual. The returned offset is the
+// absolute end of the valid prefix, measured from the beginning of the file.
+//
+// A torn first frame at the cut is not an error but the normal case of a
+// commit that crashed mid-append after the checkpoint: the frame never
+// committed, so the valid prefix ends at the cut and the checkpoint already
+// holds every state through it. Correct pairing of checkpoint and WAL is
+// established structurally (compaction retires a checkpoint before it can
+// rewrite the log), not by probing here.
+func replayFrames(f *os.File, start int64, initialSnap uint64, fn func(op byte, key string, value []byte, seq uint64)) (int64, uint64, error) {
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return 0, 0, err
+	}
 	r := bufio.NewReader(f)
-	var offset int64
-	var snapshotCount uint64
+	var offset int64 = start
+	snapshotCount := initialSnap
 	hdr := make([]byte, frameHeaderSize)
 
 	// Batch framing state.
 	inBatch := false
-	batchStart := int64(0) // offset of the batch's begin frame
+	batchStart := int64(0) // absolute offset of the batch's begin frame
 	var pending []replayedFrame
 
 	// validPrefix reports where the file must be truncated to. A bad frame
@@ -479,66 +588,34 @@ func replayWAL(dir string, fn func(op byte, key string, value []byte, seq uint64
 	}
 
 	for {
-		start := offset
-		if _, err := io.ReadFull(r, hdr); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return discard(start) // absent/torn tail: valid prefix ends here
-			}
-			return 0, 0, err
+		at := offset
+		op, body, n, cleanEOF, rerr := readFullFrame(r, hdr)
+		if rerr != nil {
+			return 0, 0, rerr
 		}
-		offset += frameHeaderSize
+		if cleanEOF {
+			return discard(at) // absent/torn tail: valid prefix ends here
+		}
+		if n == 0 {
+			return discard(at) // corrupt or torn frame: prefix ends before it
+		}
+		offset += int64(n)
 
-		magic := binary.LittleEndian.Uint32(hdr[0:4])
-		op := hdr[4]
 		keyLen := binary.LittleEndian.Uint32(hdr[5:9])
-		valLen := binary.LittleEndian.Uint32(hdr[9:13])
-		if magic != recordMagic ||
-			(op != opPut && op != opDelete && op != opMeta &&
-				op != opPutSeq && op != opDeleteSeq &&
-				op != opBatchBegin && op != opBatchEnd) ||
-			keyLen > maxRecord || valLen > maxRecord ||
-			(op == opDelete && valLen != 0) ||
-			(op == opPutSeq && valLen < seqSize) ||
-			(op == opDeleteSeq && valLen != seqSize) ||
-			(op == opMeta && (keyLen != 0 || valLen != metaValueSize)) ||
-			(op == opBatchBegin && (keyLen != 0 || valLen != 0)) ||
-			(op == opBatchEnd && (keyLen != 0 || valLen != metaValueSize)) {
-			return discard(start) // corrupt frame: valid prefix ends here
-		}
-
-		body := make([]byte, int(keyLen)+int(valLen))
-		if _, err := io.ReadFull(r, body); err != nil {
-			return discard(start)
-		}
-		offset += int64(len(body))
-
-		var crcb [crcSize]byte
-		if _, err := io.ReadFull(r, crcb[:]); err != nil {
-			return discard(start)
-		}
-		offset += crcSize
-
-		h := crc32.NewIEEE()
-		h.Write(hdr)
-		h.Write(body)
-		if binary.LittleEndian.Uint32(crcb[:]) != h.Sum32() {
-			return discard(start)
-		}
-
 		switch op {
 		case opBatchBegin:
 			if inBatch {
 				return batchStart, snapshotCount, nil // nested begin: corrupt batch
 			}
 			inBatch = true
-			batchStart = start
+			batchStart = at
 			pending = pending[:0]
 		case opBatchEnd:
 			count := binary.LittleEndian.Uint64(body)
 			if !inBatch || count != uint64(len(pending)) {
 				// Stray end, or an end whose count does not match the
 				// buffered inner frames: the framed commit is not intact.
-				return discard(start)
+				return discard(at)
 			}
 			for _, fr := range pending {
 				fn(fr.op, fr.key, fr.value, fr.seq)

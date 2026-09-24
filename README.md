@@ -19,6 +19,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Delete(key string) error` removes a key.
 - `(*Store).CommitBatch(ops []BatchOp) error` commits several changes atomically.
 - `(*Store).Snapshot() (*Snapshot, error)` opens a stable view.
+- `(*Store).Checkpoint() error` freezes complete committed state for a fast reopen.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
@@ -112,6 +113,47 @@ return nil; compacting a closed store returns an error satisfying
 the replacement is renamed into place, so the swap also succeeds on
 filesystems that refuse renaming over an open file. Compaction never splits
 or reorders versions that belong to one batch.
+
+### Checkpoints and fast reopen
+
+`Checkpoint` freezes the store's complete committed state into one
+self-describing file (`snapshot.ckpt`) so reopening is cheap: the checkpoint
+is loaded into memory and only the write-ahead log written *after* it is
+replayed, instead of replaying the whole log. The resulting state is
+byte-for-byte the same as a full log replay — every successful write and
+delete, the atomicity and within-batch last-write-wins ordering of batches,
+and the cumulative snapshot count are all preserved.
+
+The file carries the terminal key/value state (empty values stay hits,
+deletions are tombstones), the highest commit-sequence watermark, the
+cumulative snapshot count and a format version, all protected by a CRC-32.
+It is an all-or-nothing artifact: built under a temporary name, forced whole
+with one fsync, then atomically renamed into place. On reopen a missing,
+truncated, checksum-bad or unknown-version checkpoint is rejected as a whole
+— half a checkpoint is never installed. Rejection is not an error: recovery
+silently falls back to the log-only reopen path and replays the write-ahead
+log in full, and the rejected file is removed.
+
+Producing a checkpoint and making it live are separate, interruptible steps.
+A process killed at any point leaves only the pre-checkpoint state or the
+post-checkpoint state, each a complete committed state recoverable on its
+own; a half-built temporary file is swept on the next open, and no directory
+ever needs a second checkpoint (or any other repair step) before it opens
+normally. The write-ahead log is never modified by a checkpoint, so a
+checkpoint pairs only with the exact log it was taken against; compaction
+(the only log rewrite) durably removes a live checkpoint before swapping the
+log. Checkpoints may be taken repeatedly in one run; each replaces the prior
+file, which then occupies no further space.
+
+`Checkpoint` changes nothing visible. It serializes with writes, batch
+commits, snapshot acquisition, cursor opening and compaction, but never with
+lock-free reads: `Get`, scans, snapshot reads and cursor paging keep hitting
+memory and are not blocked by the checkpoint syncing to disk. It does not
+split a batch or reclaim history that an open snapshot or cursor still
+references. `Checkpoint` on a closed store returns an error satisfying
+`errors.Is(err, fs.ErrClosed)`. A directory written by an older version with
+no checkpoint reopens unchanged and upgrades to the new layout the first
+time a checkpoint is taken.
 
 ## Tests
 
