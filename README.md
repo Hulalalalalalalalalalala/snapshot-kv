@@ -17,10 +17,38 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Put(key string, value []byte) error` stores a value.
 - `(*Store).Get(key string) ([]byte, bool, error)` reads the latest value.
 - `(*Store).Delete(key string) error` removes a key.
+- `(*Store).Commit(ops []Op) error` applies a batch of puts and deletes
+  atomically.
 - `(*Store).Snapshot() (*Snapshot, error)` opens a stable view.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
+
+### Atomic batches and group commit
+
+`Op` is one batch entry: `PutOp(key, value)` stores a value and
+`DeleteOp(key)` removes a key. `Commit` applies the slice as one atomic
+unit:
+
+- A batch is either visible as a whole or not at all. A process killed
+  while a batch is being committed either replays the entire batch on
+  reopen or none of it; a snapshot or cursor sees all of it or none.
+- Batches are totally ordered by commit sequence, interleaved with single
+  `Put`/`Delete` calls (each of which is exactly a one-operation batch).
+- When several operations in one batch touch the same key, the last one in
+  slice order is the batch's effect.
+- A batch containing an empty key is rejected as a whole with an error
+  satisfying `errors.Is(err, fs.ErrInvalid)`; nothing in it is applied or
+  persisted. An empty batch returns `nil` and leaves no trace.
+- Committing on a closed store returns an error satisfying
+  `errors.Is(err, fs.ErrClosed)`. No third error type is introduced.
+
+Batches committed concurrently are ordered on one total order and their
+records share a single flush and fsync of the write-ahead log (group
+commit); `Commit` returns success only once the whole batch is durable.
+Reads keep hitting the in-memory view and are never blocked by that
+synchronization. Memory and temporary space track live data, batches
+currently queued and open cursors — not the cumulative number of commits.
 
 ### Range scans and paged cursors
 
@@ -72,12 +100,13 @@ Scans and cursor reads hit the in-memory view on the same lock-free path as
 `Compact` takes no arguments and may be called at any time. It reclaims old
 versions that have been overwritten or deleted and are no longer referenced
 by an open snapshot, both from memory and from the write-ahead log, and
-rewrites the log atomically. Every open snapshot keeps serving its exact
-fixed view through and after compaction; reopening the directory after a
-crash mid-compaction restores a complete committed state with the cumulative
-snapshot count intact. Repeated or concurrent compactions queue and all
-return nil; compacting a closed store returns an error satisfying
-`errors.Is(err, fs.ErrClosed)`.
+rewrites the log atomically. It never splits or reorders the versions of one
+batch. Every open snapshot keeps serving its exact fixed view through and
+after compaction; reopening the directory after a crash mid-compaction
+restores a complete committed state with the cumulative snapshot count
+intact and no intermediate file needing a second compaction. Repeated or
+concurrent compactions queue and all return nil; compacting a closed store
+returns an error satisfying `errors.Is(err, fs.ErrClosed)`.
 
 ## Tests
 
