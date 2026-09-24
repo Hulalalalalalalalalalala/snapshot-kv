@@ -20,4 +20,8 @@ var (
 		errors.New("snapshot: store is closed"),
 		fs.ErrClosed,
 	)
+	errCursorArgument = errors.Join(
+		errors.New("snapshot: cursor continuation offset or limit is invalid"),
+		fs.ErrInvalid,
+	)
 )
