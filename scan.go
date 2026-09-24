@@ -41,7 +41,7 @@ func (s *Store) Scan(r Range, limit int) ([]KVPair, error) {
 	if !validInterval(r.Start, r.End) {
 		return []KVPair{}, nil
 	}
-	return scanView(*s.current.Load(), r.Start, r.End, limit), nil
+	return scanView(s.current.Load(), r.Start, r.End, limit), nil
 }
 
 // ScanPrefix returns up to limit present pairs whose keys begin with prefix,
@@ -51,7 +51,7 @@ func (s *Store) ScanPrefix(prefix string, limit int) ([]KVPair, error) {
 	if s.closed.Load() {
 		return nil, errStoreClosed
 	}
-	return scanView(*s.current.Load(), prefix, prefixEnd(prefix), limit), nil
+	return scanView(s.current.Load(), prefix, prefixEnd(prefix), limit), nil
 }
 
 // OpenCursor opens a cursor over the half-open interval r of the latest
@@ -89,7 +89,7 @@ func (s *Snapshot) Scan(r Range, limit int) ([]KVPair, error) {
 	if v == nil || !validInterval(r.Start, r.End) {
 		return []KVPair{}, nil
 	}
-	return scanView(*v, r.Start, r.End, limit), nil
+	return scanView(v, r.Start, r.End, limit), nil
 }
 
 // ScanPrefix scans the snapshot's fixed view for keys beginning with prefix.
@@ -98,7 +98,7 @@ func (s *Snapshot) ScanPrefix(prefix string, limit int) ([]KVPair, error) {
 	if v == nil {
 		return []KVPair{}, nil
 	}
-	return scanView(*v, prefix, prefixEnd(prefix), limit), nil
+	return scanView(v, prefix, prefixEnd(prefix), limit), nil
 }
 
 // OpenCursor opens a cursor over the snapshot's fixed view. Versions the
@@ -183,10 +183,10 @@ func (c *Cursor) Page(off, limit int) ([]KVPair, error) {
 	if stop > len(c.keys) || stop < off {
 		stop = len(c.keys) // clamp a large page; guard against int overflow
 	}
-	v := *c.v
+	v := c.v
 	out := make([]KVPair, 0, stop-off)
 	for _, k := range c.keys[off:stop] {
-		n := v[k]
+		n := v.lookup(k)
 		if n == nil || !n.present {
 			continue // defensive: keys are fixed present-at-open, so unreachable
 		}
@@ -242,27 +242,26 @@ func newCursorPinned(st *Store, v *view, start, end string) *Cursor {
 		v:     v,
 		start: start,
 		end:   end,
-		keys:  presentKeys(*v, start, end),
+		keys:  presentKeys(v, start, end),
 	}
 }
 
 // newEmptyCursor returns a never-erroring cursor over nothing, used when a
 // cursor is opened over an empty/closed view. It pins no versions.
 func newEmptyCursor() *Cursor {
-	empty := make(view)
-	return &Cursor{v: &empty, keys: nil}
+	return &Cursor{v: newView(nil), keys: nil}
 }
 
 // ---- ordered reads over immutable views ----
 
-func scanView(v view, start, end string, limit int) []KVPair {
+func scanView(v *view, start, end string, limit int) []KVPair {
 	keys := presentKeys(v, start, end)
 	if limit > 0 && len(keys) > limit {
 		keys = keys[:limit]
 	}
 	out := make([]KVPair, 0, len(keys))
 	for _, k := range keys {
-		n := v[k]
+		n := v.lookup(k)
 		out = append(out, KVPair{Key: k, Value: cloneBytes(n.value)})
 	}
 	return out
@@ -270,20 +269,21 @@ func scanView(v view, start, end string, limit int) []KVPair {
 
 // presentKeys returns the present keys in [start,end) sorted by byte order.
 // Go's string ordering is unsigned byte ordering on the raw contents.
-func presentKeys(v view, start, end string) []string {
-	keys := make([]string, 0, len(v))
-	for k, n := range v {
+func presentKeys(v *view, start, end string) []string {
+	var keys []string
+	v.rangeEach(func(k string, n *node) bool {
 		if n == nil || !n.present {
-			continue
+			return true
 		}
 		if start != "" && k < start {
-			continue
+			return true
 		}
 		if end != "" && k >= end {
-			continue
+			return true
 		}
 		keys = append(keys, k)
-	}
+		return true
+	})
 	sort.Strings(keys)
 	return keys
 }

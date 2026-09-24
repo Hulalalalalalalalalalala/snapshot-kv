@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -62,15 +63,49 @@ func exerciseStore(t *testing.T, s *Store, tag string) {
 
 func checkpointExists(t *testing.T, dir string) bool {
 	t.Helper()
-	_, err := os.Stat(filepath.Join(dir, checkpointName))
-	if err == nil {
-		return true
+	entries, err := os.ReadDir(filepath.Join(dir, checkpointDirName))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+		t.Fatalf("read checkpoint dir: %v", err)
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return false
+	for _, e := range entries {
+		if _, ok := parseLayerIndex(e.Name()); ok {
+			return true
+		}
 	}
-	t.Fatalf("stat checkpoint: %v", err)
 	return false
+}
+
+// chainLayerFiles returns the final layer files of the checkpoint chain.
+func chainLayerFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, checkpointDirName))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		t.Fatalf("read checkpoint dir: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if _, ok := parseLayerIndex(e.Name()); ok {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// newestLayerPath returns the path of the highest-indexed layer file.
+func newestLayerPath(t *testing.T, dir string) string {
+	t.Helper()
+	layers := chainLayerFiles(t, dir)
+	if len(layers) == 0 {
+		t.Fatal("no checkpoint layers present")
+	}
+	return filepath.Join(dir, checkpointDirName, layers[len(layers)-1])
 }
 
 func TestCheckpointReopenMatchesFullReplay(t *testing.T) {
@@ -253,7 +288,7 @@ func TestCheckpointRejectsCorruptAndFallsBack(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			cpPath := filepath.Join(dir, checkpointName)
+			cpPath := newestLayerPath(t, dir)
 			b, err := os.ReadFile(cpPath)
 			if err != nil {
 				t.Fatal(err)
@@ -285,11 +320,11 @@ func TestCheckpointRejectsCorruptAndFallsBack(t *testing.T) {
 	}
 }
 
-func TestCheckpointRepeatedReplacesOldFile(t *testing.T) {
+func TestCheckpointRepeatedBuildsChainAndHonorsWindow(t *testing.T) {
 	dir := tempDir(t)
 	s := openStore(t, dir)
 
-	names := func() []string {
+	storeNames := func() []string {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatal(err)
@@ -302,29 +337,36 @@ func TestCheckpointRepeatedReplacesOldFile(t *testing.T) {
 		return out
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < checkpointWindow+3; i++ {
 		if err := s.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Checkpoint(); err != nil {
 			t.Fatalf("checkpoint %d: %v", i, err)
 		}
-		got := names()
-		var ckpts int
-		for _, n := range got {
-			if n == checkpointName {
-				ckpts++
-			}
-			if n == checkpointTmpName {
-				t.Fatal("checkpoint temp left behind after success")
+		// No staging debris at the store root; the chain directory holds only
+		// final layer files (chainLayerFiles skips temps, which would error).
+		for _, n := range storeNames() {
+			if n == checkpointTmpName || n == stagedChainDir {
+				t.Fatalf("iteration %d: leftover staging artifact %q", i, n)
 			}
 		}
-		if ckpts != 1 {
-			t.Fatalf("iteration %d: expected exactly one checkpoint, got %v", i, got)
+		// The chain directory must hold only final layer files, never temps.
+		raw, rerr := os.ReadDir(filepath.Join(dir, checkpointDirName))
+		if rerr != nil {
+			t.Fatalf("iteration %d: read chain dir: %v", i, rerr)
+		}
+		for _, e := range raw {
+			if strings.HasSuffix(e.Name(), layerTmpSuffix) {
+				t.Fatalf("iteration %d: layer temp left behind: %q", i, e.Name())
+			}
+		}
+		if got := len(chainLayerFiles(t, dir)); got > checkpointWindow {
+			t.Fatalf("iteration %d: %d live layers, want <= %d", i, got, checkpointWindow)
 		}
 	}
 
-	// Each new checkpoint subsumes all prior history: reopen from the last.
+	// The newest chain plus the WAL tail subsumes every commit: reopen.
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +375,7 @@ func TestCheckpointRepeatedReplacesOldFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	for i := 0; i < 5; i++ {
+	for i := 0; i < checkpointWindow+3; i++ {
 		if got, ok, _ := s2.Get(fmt.Sprintf("k%d", i)); !ok || string(got) != fmt.Sprintf("v%d", i) {
 			t.Fatalf("k%d after repeated checkpoints: %q ok=%v", i, got, ok)
 		}
@@ -585,7 +627,7 @@ func TestCheckpointTornBatchInTailDiscardedWholesale(t *testing.T) {
 	}
 }
 
-func TestCompactRetiresCheckpoint(t *testing.T) {
+func TestCompactReanchorsCheckpointChain(t *testing.T) {
 	dir := tempDir(t)
 	s := openStore(t, dir)
 	if err := s.Put("k", []byte("v1")); err != nil {
@@ -607,8 +649,9 @@ func TestCompactRetiresCheckpoint(t *testing.T) {
 	if err := s.Compact(); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	if checkpointExists(t, dir) {
-		t.Fatal("checkpoint survived the WAL rewrite; it could pair with the wrong log")
+	// In-window generations survive the WAL rewrite, re-anchored to it.
+	if !checkpointExists(t, dir) {
+		t.Fatal("in-window checkpoint layer was not re-anchored to the new WAL")
 	}
 	// Pinned snapshot still reads its view through and after compaction.
 	if got, ok := old.Get("k"); !ok || string(got) != "v1" {
@@ -620,7 +663,7 @@ func TestCompactRetiresCheckpoint(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Full WAL replay after the checkpoint was retired: state intact.
+	// Reopen seeds the re-anchored chain and replays its tail: state intact.
 	s2, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -632,7 +675,7 @@ func TestCompactRetiresCheckpoint(t *testing.T) {
 	if n := s2.Stats().Snapshots; n != 1 {
 		t.Fatalf("snapshot count: %d want 1", n)
 	}
-	// A fresh checkpoint upgrades the compacted layout again.
+	// A fresh delta checkpoint extends the re-anchored chain.
 	if err := s2.Put("m", []byte("n")); err != nil {
 		t.Fatal(err)
 	}

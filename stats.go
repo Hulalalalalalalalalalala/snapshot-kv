@@ -15,15 +15,16 @@ type Stats struct {
 // Stats returns statistics over the latest committed view. It does not count
 // as taking a snapshot.
 func (s *Store) Stats() Stats {
-	v := *s.current.Load()
+	v := s.current.Load()
 	var keys int
 	var totalBytes int
-	for _, n := range v {
+	v.rangeEach(func(_ string, n *node) bool {
 		if n.present {
 			keys++
 			totalBytes += len(n.value)
 		}
-	}
+		return true
+	})
 	st := Stats{Keys: keys, Snapshots: s.snapshots.Load()}
 	if keys > 0 {
 		// Exact half-up rounding to hundredths using integer math, avoiding

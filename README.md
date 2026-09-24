@@ -116,34 +116,56 @@ or reorders versions that belong to one batch.
 
 ### Checkpoints and fast reopen
 
-`Checkpoint` freezes the store's complete committed state into one
-self-describing file (`snapshot.ckpt`) so reopening is cheap: the checkpoint
-is loaded into memory and only the write-ahead log written *after* it is
-replayed, instead of replaying the whole log. The resulting state is
-byte-for-byte the same as a full log replay — every successful write and
-delete, the atomicity and within-batch last-write-wins ordering of batches,
-and the cumulative snapshot count are all preserved.
+`Checkpoint` freezes the store's complete committed state into a
+self-describing, checksummed **chain of layers** (inside the `ckpt/`
+directory) so reopening is cheap: the layers are loaded and only the
+write-ahead log written after the newest layer is replayed, instead of
+replaying the whole log. The resulting state is byte-for-byte the same as a
+full log replay — every successful write and delete, the atomicity and
+within-batch last-write-wins ordering of batches, and the cumulative snapshot
+count are all preserved.
 
-The file carries the terminal key/value state (empty values stay hits,
-deletions are tombstones), the highest commit-sequence watermark, the
-cumulative snapshot count and a format version, all protected by a CRC-32.
-It is an all-or-nothing artifact: built under a temporary name, forced whole
-with one fsync, then atomically renamed into place. On reopen a missing,
-truncated, checksum-bad or unknown-version checkpoint is rejected as a whole
-— half a checkpoint is never installed. Rejection is not an error: recovery
-silently falls back to the log-only reopen path and replays the write-ahead
-log in full, and the rejected file is removed.
+The first layer (the **base**, index 0) holds the complete key/value state at
+its capture time (empty values stay hits, deletions are tombstones). Every
+later layer is a **delta** covering only the keys touched by commits strictly
+after the layer it builds on. Each layer carries a format version, its layer
+index, a content hash linking it to the previous layer, the highest
+commit-sequence watermark covered, the cumulative snapshot count, the WAL
+byte offset of its cut and a per-entry commit sequence, all protected by a
+CRC-32 over the whole file.
 
-Producing a checkpoint and making it live are separate, interruptible steps.
-A process killed at any point leaves only the pre-checkpoint state or the
-post-checkpoint state, each a complete committed state recoverable on its
-own; a half-built temporary file is swept on the next open, and no directory
-ever needs a second checkpoint (or any other repair step) before it opens
-normally. The write-ahead log is never modified by a checkpoint, so a
-checkpoint pairs only with the exact log it was taken against; compaction
-(the only log rewrite) durably removes a live checkpoint before swapping the
-log. Checkpoints may be taken repeatedly in one run; each replaces the prior
-file, which then occupies no further space.
+Reopen loads the layers in index order and stops at the last complete, intact
+layer of one unbroken chain, then replays the WAL tail from that layer's cut.
+Any layer that is missing, truncated, checksum-bad, of an unknown version or
+whose link to the previous layer is broken rejects that layer and every later
+layer as a whole — half a layer is never installed. Recovery then falls back
+to the previous usable layer, or, when even the base is unusable, to a
+log-only reopen that replays the write-ahead log in full; the rejected suffix
+is removed. The cut of the selected layer must lie inside the exact WAL the
+chain pairs with, otherwise that suffix is rejected too.
+
+A layer is an all-or-nothing artifact: built under a temporary name, forced
+whole with one fsync, then atomically renamed into place. Producing a layer
+and making it live are separate, interruptible steps. A process killed at any
+point leaves only the chain without that layer or the chain extended by the
+complete layer, each a complete committed state recoverable on its own; a
+half-built temporary file is swept on the next open, and no directory ever
+needs a second checkpoint (or any other repair step) before it opens normally.
+
+Only the newest `4` generations are kept (the retention window). Appending a
+layer past the window rebuilds the chain around its newest members against the
+unchanged WAL — the oldest surviving layer becomes a fresh full base — and the
+retired layers are deleted immediately, so they occupy no further directory
+space. Directory and memory usage track live data, queued batches, open
+cursors/snapshots and the retained layers, never cumulative commits.
+
+The write-ahead log is never modified by a checkpoint, so a layer pairs only
+with the exact log it was captured against. Compaction (the only log rewrite)
+durably withdraws the old chain before swapping the log; the layers inside the
+retention window are re-anchored against the replacement log — the new log is
+written as one segment per surviving layer at a fresh cut, with the rebuilt
+layers referencing those cuts — while layers outside the window are retired
+and deleted. Checkpoints may be taken repeatedly in one run.
 
 `Checkpoint` changes nothing visible. It serializes with writes, batch
 commits, snapshot acquisition, cursor opening and compaction, but never with
@@ -152,8 +174,9 @@ memory and are not blocked by the checkpoint syncing to disk. It does not
 split a batch or reclaim history that an open snapshot or cursor still
 references. `Checkpoint` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`. A directory written by an older version with
-no checkpoint reopens unchanged and upgrades to the new layout the first
-time a checkpoint is taken.
+the single-file `snapshot.ckpt` (or with no checkpoint at all) reopens
+unchanged and upgrades to the layered layout the first time a checkpoint is
+taken.
 
 ## Tests
 

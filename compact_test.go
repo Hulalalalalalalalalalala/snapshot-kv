@@ -183,13 +183,14 @@ func TestCompactDropsInMemoryHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	v := *s.current.Load()
-	for key, n := range v {
+	v := s.current.Load()
+	v.rangeEach(func(key string, n *node) bool {
 		if n.older != nil {
 			t.Fatalf("current node for %q still keeps history after compaction", key)
 		}
-	}
-	if n := v["gone"]; n != nil {
+		return true
+	})
+	if n := v.lookup("gone"); n != nil {
 		t.Fatalf("deleted key retained a node in compacted view: %+v", n)
 	}
 	if got, ok, _ := s.Get("k"); !ok || string(got) != "new" {
