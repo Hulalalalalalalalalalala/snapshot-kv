@@ -115,8 +115,12 @@ type Store struct {
 	chain []layerState
 	// dirty keys were touched by effective commits strictly after the newest
 	// layer in chain; they are exactly the keys the next delta layer covers.
-	// nil until the first such commit.
-	dirty []string
+	// nil until the first such commit. dirtySet holds the same keys as a set
+	// so repeated commits to already-dirty keys cost O(1) and the list never
+	// accumulates duplicates: its size stays bounded by distinct keys, not
+	// by cumulative commits.
+	dirty    []string
+	dirtySet map[string]struct{}
 	// legacyLive reports that a version-1 single-file snapshot.ckpt was the
 	// checkpoint paired with the WAL at open and has not been replaced by a
 	// layered chain or retired by compaction. Compaction must durably retire
@@ -143,6 +147,12 @@ type Store struct {
 	// become leader, before its first queue drain, and lets tests hold a
 	// leader until a known number of commits have coalesced.
 	leaderHook func()
+
+	// backupMu serializes Backup calls, which share no state with the commit
+	// path but stage their artifact under a name derived from the output
+	// path; two concurrent exports from one store to the same directory
+	// would otherwise race on that staging directory.
+	backupMu sync.Mutex
 
 	closed atomic.Bool
 }
@@ -186,6 +196,9 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	if err := sweepStagedChain(dir); err != nil {
+		return nil, err
+	}
+	if err := sweepBackupStaging(dir); err != nil {
 		return nil, err
 	}
 
@@ -308,9 +321,9 @@ func Open(dir string) (*Store, error) {
 		cursors:    make(map[*Cursor]struct{}),
 		nextSeq:    replaySeq,
 		chain:      chain,
-		dirty:      dedupeKeys(nil, tailTouched),
 		legacyLive: legacyLive,
 	}
+	s.setDirty(dedupeKeys(nil, tailTouched))
 	s.snapshots.Store(snapshotCount)
 	s.current.Store(latest)
 	return s, nil
@@ -329,6 +342,44 @@ func dedupeKeys(dst, src []string) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// noteDirty records keys as touched since the newest checkpoint layer. Keys
+// already recorded cost nothing, so queuing the same key again and again
+// never grows the record: its size tracks distinct dirty keys only.
+func (s *Store) noteDirty(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	if s.dirtySet == nil {
+		s.dirtySet = make(map[string]struct{}, len(keys))
+	}
+	for _, k := range keys {
+		if _, ok := s.dirtySet[k]; ok {
+			continue
+		}
+		s.dirtySet[k] = struct{}{}
+		s.dirty = append(s.dirty, k)
+	}
+}
+
+// setDirty replaces the dirty record with an already deduplicated list.
+func (s *Store) setDirty(keys []string) {
+	s.dirty = keys
+	s.dirtySet = nil
+	if len(keys) > 0 {
+		s.dirtySet = make(map[string]struct{}, len(keys))
+		for _, k := range keys {
+			s.dirtySet[k] = struct{}{}
+		}
+	}
+}
+
+// clearDirty empties the dirty record after a checkpoint or compaction has
+// accounted for every touched key.
+func (s *Store) clearDirty() {
+	s.dirty = nil
+	s.dirtySet = nil
 }
 
 // Put stores value under key. An empty key returns an error wrapping
@@ -599,7 +650,7 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 			s.current.Store(plan.view)
 		}
 	}
-	s.dirty = dedupeKeys(s.dirty, groupDirty)
+	s.noteDirty(groupDirty)
 	return results
 }
 
@@ -769,7 +820,7 @@ func (s *Store) Compact() error {
 			// next Checkpoint starts a fresh base with no O_EXCL collision.
 			dropCheckpoint := func() {
 				s.chain = nil
-				s.dirty = nil
+				s.clearDirty()
 				os.RemoveAll(checkpointDirPath(s.dir))
 			}
 			if window == 0 {
@@ -786,7 +837,7 @@ func (s *Store) Compact() error {
 					dropCheckpoint()
 				} else {
 					s.chain = info.layers
-					s.dirty = seg.tailKeys
+					s.setDirty(seg.tailKeys)
 				}
 			}
 		}
@@ -796,7 +847,7 @@ func (s *Store) Compact() error {
 		// pairs with this WAL. Committing continues; the next Checkpoint heals.
 		removeStagedChain(s.dir)
 		s.chain = nil
-		s.dirty = nil
+		s.clearDirty()
 	}
 	return installErr
 }
@@ -890,7 +941,7 @@ func (s *Store) Checkpoint() error {
 		return err
 	}
 	s.chain = info.layers
-	s.dirty = nil
+	s.clearDirty()
 
 	// Enforce the retention window: keep only the newest checkpointWindow
 	// layers, rebuilt as a standalone chain against the same unchanged WAL.
