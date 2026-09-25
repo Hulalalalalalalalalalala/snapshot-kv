@@ -12,14 +12,17 @@ import (
 	"sync/atomic"
 )
 
-// viewFlattenLimit bounds how deep an overlay chain a published view grows
-// before the next commit builds it on a flattened copy. Without a bound the
-// chain would gain one map per commit for the life of the store and memory
-// would track cumulative commits; flattening every viewFlattenLimit commits
-// keeps live depth (and the work a read or checkpoint walk does) independent
-// of commit count, while the flattened copies stay immutable for every
-// snapshot already holding an older view.
-const viewFlattenLimit = 64
+// Overlay chains are kept shallow by run merging, exactly as a binomial
+// queue keeps few trees: every overlay carries a span (the number of key
+// entries the run ending at it covers), and whenever the run on top is at
+// least as large as the run directly below, the two are merged into one
+// fresh overlay. Run sizes therefore decrease geometrically from the flat
+// base upward, the chain stays O(log n) deep without any fixed limit, and
+// the temporary allocation a commit pays is proportional to the runs it
+// actually merges — keys touched since those runs formed — never to the
+// live keyspace, no matter how many commits queue up. Merging allocates a
+// fresh map and never mutates the runs it combines, so every view already
+// published stays immutable.
 
 // node is one immutable version in a key's history. Versions form a linked
 // list from newest to oldest; a snapshot pins the head current when it was
@@ -40,22 +43,21 @@ type node struct {
 // of overlays; the current view, snapshots and cursors simply point at one.
 //
 // A view's keys map may itself hold the whole keyspace: the base layer
-// (base == nil) used by recovery, compaction and periodic flattening. Maps
-// are never mutated after publication, so reading them needs no lock; only
-// the commit path, which has just created a fresh overlay, writes its keys.
+// (base == nil) built by recovery and compaction. Maps are never mutated
+// after publication, so reading them needs no lock; only the commit path,
+// which has just created a fresh overlay, writes its keys.
 type view struct {
-	keys  map[string]*node
-	base  *view
-	depth int // number of overlays from this view to its flat base
+	keys map[string]*node
+	base *view
+	// span is the number of key entries the run ending at this view covers
+	// (an upper bound once runs merge). It only balances merging; the flat
+	// base never merges, so its span is unused.
+	span int
 }
 
 // newView returns an empty overlay atop base (nil for a flat base view).
 func newView(base *view) *view {
-	d := 1
-	if base != nil {
-		d = base.depth + 1
-	}
-	return &view{keys: make(map[string]*node), base: base, depth: d}
+	return &view{keys: make(map[string]*node), base: base}
 }
 
 // lookup returns the newest version recorded for key anywhere along the
@@ -86,16 +88,30 @@ func (v *view) rangeEach(fn func(key string, n *node) bool) {
 	}
 }
 
-// flatten materializes one flat map holding the view's complete terminal
-// state. It allocates a fresh map and shares only immutable nodes, so views
-// already published stay untouched.
-func (v *view) flatten() *view {
-	flat := newView(nil)
-	v.rangeEach(func(k string, n *node) bool {
-		flat.keys[k] = n
-		return true
-	})
-	return flat
+// mergeRuns merges the run ending at v with the run directly below while
+// the lower run is no larger, keeping run sizes geometrically decreasing
+// from the flat base upward. The flat base itself (base == nil) is never
+// merged into — copying it would cost the whole live keyspace. Each merge
+// allocates one fresh map sized by the two runs combined and leaves both
+// source runs untouched, so the temporary allocation tracks only the keys
+// those runs cover, and every view already published stays valid.
+func mergeRuns(v *view) *view {
+	for v.base != nil && v.base.base != nil && v.base.span <= v.span {
+		lower := v.base
+		merged := &view{
+			keys: make(map[string]*node, len(lower.keys)+len(v.keys)),
+			base: lower.base,
+			span: lower.span + v.span,
+		}
+		for k, n := range lower.keys {
+			merged.keys[k] = n
+		}
+		for k, n := range v.keys { // the upper run shadows on conflict
+			merged.keys[k] = n
+		}
+		v = merged
+	}
+	return v
 }
 
 // Store is an open key-value store backed by a directory on disk.
@@ -154,6 +170,8 @@ type Store struct {
 type Snapshot struct {
 	v     atomic.Pointer[view] // nil once the snapshot is closed
 	store *Store               // back-reference for cursor pin accounting
+	seq   uint64               // commit watermark the fixed view was captured at
+	snaps uint64               // cumulative snapshot count including this one
 }
 
 // Open opens or creates a persistent store in dir. A path that names a
@@ -178,8 +196,12 @@ func Open(dir string) (*Store, error) {
 	// be complete state of record; the old wal.log is. Drop the stale file.
 	// Likewise, staging debris from a kill mid-checkpoint (a half-built layer
 	// temp or a legacy single-file temp) is swept: only finished layers are
-	// ever read.
+	// ever read. A staged log from a restore killed before its rename is
+	// swept the same way: only the finished wal.log is state of record.
 	if err := removeStaleCompact(dir); err != nil {
+		return nil, err
+	}
+	if err := sweepRestoreDebris(dir); err != nil {
 		return nil, err
 	}
 	if err := sweepCheckpointDebris(dir); err != nil {
@@ -544,11 +566,10 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 		// batch's overlay, so the view it publishes is a valid point-in-time
 		// state independent of later batches, and queued batches cost memory
 		// proportional to their own ops rather than the whole live keyspace.
-		// When the chain has grown deep, flatten first so live depth stays
-		// bounded by viewFlattenLimit instead of cumulative commit count.
-		if base.depth >= viewFlattenLimit {
-			base = base.flatten()
-		}
+		// Run merging then keeps the chain O(log n) deep; a merge copies
+		// only the keys of the two runs it combines, so the temporary
+		// allocation tracks recently touched keys and never the live
+		// keyspace, however many commits queue up.
 		v := newView(base)
 		var changes []batchChange
 		for i := range p.ops {
@@ -577,6 +598,10 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 				groupDirty = append(groupDirty, changes[i].key)
 			}
 		}
+		// Even an empty overlay (a no-op batch) joins run merging, so a
+		// stream of no-op commits cannot grow the chain either.
+		v.span = len(v.keys)
+		v = mergeRuns(v)
 		var planView *view
 		if len(changes) > 0 {
 			planView = v
@@ -986,7 +1011,7 @@ func (s *Store) Snapshot() (*Snapshot, error) {
 		s.snapshots.Add(^uint64(0))
 		return nil, err
 	}
-	snap := &Snapshot{store: s}
+	snap := &Snapshot{store: s, seq: s.nextSeq, snaps: count}
 	snap.v.Store(s.current.Load())
 	return snap, nil
 }

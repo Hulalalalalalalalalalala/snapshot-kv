@@ -21,6 +21,9 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Snapshot() (*Snapshot, error)` opens a stable view.
 - `(*Store).Checkpoint() error` freezes complete committed state for a fast reopen.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
+- `(*Store).Backup(dir string) error` exports complete committed state at a fixed watermark.
+- `(*Snapshot).Backup(dir string) error` exports the snapshot's fixed view.
+- `snapshot.Restore(backupDir, targetDir string) error` materializes a backup as a new store directory.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
 
@@ -177,6 +180,58 @@ references. `Checkpoint` on a closed store returns an error satisfying
 the single-file `snapshot.ckpt` (or with no checkpoint at all) reopens
 unchanged and upgrades to the layered layout the first time a checkpoint is
 taken.
+
+### Backup and restore
+
+`Backup` exports the store's complete committed state at one fixed commit
+watermark — every key/value, every batch-committed change and the cumulative
+snapshot count — into a caller-chosen directory, and `Restore` materializes
+such a backup into a brand-new store directory that `Open` opens directly:
+
+- `(*Store).Backup(dir string) error` exports the latest committed state.
+- `(*Snapshot).Backup(dir string) error` exports the snapshot's fixed view:
+  the restored store replays to the precise state the snapshot observes, no
+  matter what has been committed since.
+- `snapshot.Restore(backupDir, targetDir string) error` validates a backup
+  and builds `targetDir` as a ready-to-open store.
+
+The export is written as a set of **segments** (`backup-*.seg`) so a large
+state is produced in bounded pieces, and the backup directory can be moved
+elsewhere as a whole: every segment is self-describing, carrying a format
+version, its segment index and the segment total, the export watermark, the
+cumulative snapshot count and a CRC-32 over the whole segment. Restore
+accepts a backup only as a whole — a missing, truncated, checksum-bad,
+unknown-version or disagreeing segment rejects the entire restore with an
+error satisfying `errors.Is(err, fs.ErrInvalid)`, before anything is
+written to the target.
+
+Reopening a restored directory replays to exactly the exported watermark:
+the key/value state matches a full replay of the source at that point, the
+cumulative snapshot count is preserved and new commits continue the exported
+commit sequence. The restored directory is complete on its own — it never
+needs a second export, checkpoint or compaction before it opens normally.
+
+The export watermark is captured under the same brief lock a snapshot
+acquisition takes, and the export then runs off the immutable view holding
+no store lock: writes, deletes, batch commits, snapshot open/close, cursor
+paging, checkpoints and compactions all proceed concurrently and never block
+on it, and reads keep hitting memory directly. The export walks the live
+view in place rather than copying the keyspace, so its peak memory tracks
+only the keys it touches. Taking a backup does not count as taking a
+snapshot.
+
+Each segment is built under a temporary name, forced whole with one fsync
+and atomically renamed into place; the restored log is staged and swapped in
+the same way. A process killed at any point during export or restore leaves
+only complete artifacts plus temporary debris — the debris is swept on the
+next open or the next run, the store being exported is never touched, and no
+directory is left needing a repair step.
+
+An empty target path, or a target that names a regular file, fails `Backup`
+and `Restore` with an error satisfying `errors.Is(err, fs.ErrInvalid)`; a
+restore target that already contains store data is rejected the same way,
+and a missing target directory is created. `Backup` on a closed store (or a
+closed snapshot) returns an error satisfying `errors.Is(err, fs.ErrClosed)`.
 
 ## Tests
 
