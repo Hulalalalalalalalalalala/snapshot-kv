@@ -201,6 +201,9 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	sweepRestoreDebris(dir)
+	// Sweep sibling debris a chain merge killed mid-commit can leave next to
+	// a directory that was used as a backup chain.
+	sweepMergeDebris(dir)
 
 	latest := newView(nil)
 	var replaySeq uint64

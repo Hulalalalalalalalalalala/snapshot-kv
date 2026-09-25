@@ -23,6 +23,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
 - `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to an existing backup chain.
+- `(*Store).MergeChain(chainDir string, rings int) error` folds the chain head and its first rings into one new full head and retires the absorbed rings.
 - `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (a lone full artifact or a full head plus its incremental rings) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
@@ -281,6 +282,44 @@ modified. A chain directory that does not exist, is not a directory, holds no
 valid head, or is itself damaged is rejected wholesale with
 `errors.Is(err, fs.ErrInvalid)` and leaves no partial ring;
 `BackupIncremental` on a closed store returns an error satisfying
+`errors.Is(err, fs.ErrClosed)`.
+
+### Merging a backup chain
+
+`MergeChain(chainDir, rings)` folds the chain head and its first `rings`
+incremental rings into one new full head, so a chain that only grows can be
+compacted back down. The merged head is exactly the complete committed state
+at the last merged ring's watermark — keys, values and the cumulative
+snapshot count are preserved, and deletes covered by the merged rings read
+back as misses. The rings beyond the merged prefix stay on the chain with
+their entries, watermarks and snapshot counts unchanged, renumbered from 1
+behind the new head, and the absorbed rings are deleted. The merged chain
+passes the same whole-chain validation `Restore` performs — dense ring
+numbering, continuous watermarks, unbroken content-CRC links, the same format
+version — and later `BackupIncremental` rings append to it exactly as before,
+so restoring before and after a merge yields byte-for-byte the same terminal
+state and cumulative snapshot count.
+
+The merge streams every artifact in bounded chunks (a k-way merge over the
+key-sorted head and ring streams) and never holds the whole keyspace in
+memory. It runs entirely on the chain directory: the backed-up store is never
+modified, and writes, batch commits, snapshot open/close, cursor paging,
+checkpoints, compactions, incremental exports and lock-free reads proceed
+while it runs. The new chain is assembled in a `<chain>.merge-new-*` sibling
+directory, validated as a whole, and swapped into place (the old chain moves
+to a `<chain>.merge-old-*` sibling and is deleted once the new one is
+installed), so a kill at any instant leaves either the old chain or the
+complete new chain; leftover staging or trash siblings are swept at the next
+merge, backup or export into that directory or the next open of a related
+directory.
+
+A ring count below one or beyond the chain's ring count, a chain directory
+that is missing, not a directory, missing its head, or itself damaged (a
+missing ring, a broken link, a non-continuous watermark, truncation, a
+checksum failure or an unknown version), or a chain advanced concurrently
+during the merge, rejects the whole operation with an error satisfying
+`errors.Is(err, fs.ErrInvalid)` and leaves the chain exactly as it was.
+`MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
 ## Tests

@@ -390,6 +390,10 @@ type artifactInfo struct {
 	tipCRC    uint32 // content CRC the next ring must link to
 	endWM     uint64 // watermark of the chain tip
 	snaps     uint64 // cumulative snapshot count at the chain tip
+	// ringSums holds the validated summary of every ring, in chain order
+	// (ringSums[i] describes ring i+1). MergeChain uses it to re-link the
+	// rings that survive a merge without re-streaming the chain.
+	ringSums []ringSummary
 }
 
 // validateBackupChain inspects backupDir as one whole chain: the head
@@ -468,6 +472,7 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 	prevSnaps := head.snaps
 	prevLink := head.crc
 	tipCRC := head.crc
+	ringSums := make([]ringSummary, 0, ringCount)
 	for idx := uint32(1); idx <= ringCount; idx++ {
 		f, oerr := os.Open(filepath.Join(backupDir, ringName(idx)))
 		if oerr != nil {
@@ -485,6 +490,7 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 		if sum.snaps < prevSnaps {
 			return zero, errBadBackup
 		}
+		ringSums = append(ringSums, sum)
 		prevWM = sum.endWM
 		prevSnaps = sum.snaps
 		prevLink = sum.fileCRC
@@ -496,6 +502,7 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 		tipCRC:    tipCRC,
 		endWM:     prevWM,
 		snaps:     prevSnaps,
+		ringSums:  ringSums,
 	}, nil
 }
 
@@ -676,6 +683,9 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	if chainDir == "" {
 		return errBadBackup
 	}
+	// Repair or clear debris from a merge killed mid-commit before inspecting
+	// the chain.
+	sweepMergeDebris(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
