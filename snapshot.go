@@ -188,6 +188,13 @@ func Open(dir string) (*Store, error) {
 	if err := sweepStagedChain(dir); err != nil {
 		return nil, err
 	}
+	// Sweep debris from a hot backup that was killed before its manifest, and
+	// from a restore killed before its target rename. These names never appear
+	// in a live store, so a store that was merely backed up is unaffected.
+	if err := openBackupSweep(dir); err != nil {
+		return nil, err
+	}
+	sweepRestoreDebris(dir)
 
 	latest := newView(nil)
 	var replaySeq uint64
@@ -539,33 +546,50 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 	encodedAny := false
 	var groupDirty []string
 
+	// head caches the group-cumulative terminal node of every key the queued
+	// batches touch: a nil entry means "known absent in base". It is sized by
+	// the batches' distinct keys, never by the live keyspace. The baseline
+	// flattened the whole view inside this loop every viewFlattenLimit queued
+	// batches, so a long queue behind one sync copied the live keyspace once
+	// per viewFlattenLimit batches; now each touched key walks the (already
+	// bounded) overlay chain at most once and at most one full keyspace map is
+	// built per group, after the last overlay.
+	head := make(map[string]*node)
+	resolve := func(key string) *node {
+		if n, ok := head[key]; ok {
+			return n // nil records a key known to be absent
+		}
+		n := base.lookup(key)
+		head[key] = n
+		return n
+	}
+
 	for _, p := range group {
 		// Each batch gets its own thin immutable overlay on the previous
 		// batch's overlay, so the view it publishes is a valid point-in-time
 		// state independent of later batches, and queued batches cost memory
 		// proportional to their own ops rather than the whole live keyspace.
-		// When the chain has grown deep, flatten first so live depth stays
-		// bounded by viewFlattenLimit instead of cumulative commit count.
-		if base.depth >= viewFlattenLimit {
-			base = base.flatten()
-		}
 		v := newView(base)
 		var changes []batchChange
 		for i := range p.ops {
 			op := &p.ops[i]
-			head := v.lookup(op.Key)
+			headNode := resolve(op.Key)
 			if op.Delete {
-				if head == nil || !head.present {
+				if headNode == nil || !headNode.present {
 					continue // idempotent no-op, matching the single Delete
 				}
 				seq++
+				nn := &node{present: false, seq: seq, older: headNode}
 				changes = append(changes, batchChange{key: op.Key, seq: seq, delete: true})
-				v.keys[op.Key] = &node{present: false, seq: seq, older: head}
+				v.keys[op.Key] = nn
+				head[op.Key] = nn
 			} else {
 				seq++
 				value := cloneBytes(op.Value)
+				nn := &node{value: value, present: true, seq: seq, older: headNode}
 				changes = append(changes, batchChange{key: op.Key, seq: seq, value: value})
-				v.keys[op.Key] = &node{value: value, present: true, seq: seq, older: head}
+				v.keys[op.Key] = nn
+				head[op.Key] = nn
 			}
 		}
 		if len(changes) > 0 {
@@ -594,10 +618,24 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 	}
 
 	s.nextSeq = seq
+	// Publish one view per effective batch in queue order, so each batch's
+	// state becomes observable atomically as its own point-in-time view. Then,
+	// whenever the chain reached the depth bound, publish one flattened final
+	// view. That flatten builds one full keyspace map at most (after the last
+	// overlay) and keeps read depth and the next group's baseline bounded by
+	// viewFlattenLimit rather than by queue length; the baseline built one full
+	// map per viewFlattenLimit queued batches inside the loop.
+	var finalFlat *view
+	if base.depth >= viewFlattenLimit {
+		finalFlat = base.flatten()
+	}
 	for _, plan := range plans {
 		if plan.view != nil {
 			s.current.Store(plan.view)
 		}
+	}
+	if finalFlat != nil {
+		s.current.Store(finalFlat)
 	}
 	s.dirty = dedupeKeys(s.dirty, groupDirty)
 	return results

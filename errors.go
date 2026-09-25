@@ -24,4 +24,8 @@ var (
 		errors.New("snapshot: cursor continuation offset or limit is invalid"),
 		fs.ErrInvalid,
 	)
+	errBadBackup = errors.Join(
+		errors.New("snapshot: backup artifact or path is invalid"),
+		fs.ErrInvalid,
+	)
 )

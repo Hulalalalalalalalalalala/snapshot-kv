@@ -21,6 +21,8 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Snapshot() (*Snapshot, error)` opens a stable view.
 - `(*Store).Checkpoint() error` freezes complete committed state for a fast reopen.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
+- `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
+- `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
 
@@ -177,6 +179,56 @@ references. `Checkpoint` on a closed store returns an error satisfying
 the single-file `snapshot.ckpt` (or with no checkpoint at all) reopens
 unchanged and upgrades to the layered layout the first time a checkpoint is
 taken.
+
+### Hot backup and restore
+
+`Backup(outDir)` exports the store's complete committed state at one fixed
+commit watermark as a portable artifact inside `outDir`. The export anchors to
+the state current at one instant; writes and deletes committed after the
+anchor do not enter the artifact, and the foreground keeps committing while
+the export runs. The anchor is the only point at which `Backup` takes the
+write lock — the keyspace is then streamed out without it, so writes, batch
+commits, snapshot acquisition, cursor paging, checkpoints and compactions all
+proceed during a backup and never block on its disk writes; lock-free reads
+keep hitting memory exactly as usual.
+
+The artifact is segmented and streamed: each segment is self-describing and
+carries a format version, the export watermark, the cumulative snapshot count
+and a CRC-32 over the whole segment, and entries flow to disk in bounded
+chunks — the whole keyspace is never copied into memory before being written.
+A `manifest.dat`, written and fsynced last, is the commit point: it records the
+artifact-level metadata and the index, entry count, cumulative count and
+content checksum of every segment. The artifact is therefore complete if and
+only if the manifest is present, intact and agrees exactly with the segment
+files on disk.
+
+`snapshot.Restore(backupDir, targetDir)` validates the artifact as one whole
+and installs a ready-to-open store into `targetDir`, returning it already
+open. A missing segment, a truncated segment, a checksum mismatch, an unknown
+format version, or a manifest that disagrees with the files rejects the entire
+backup with an error satisfying `errors.Is(err, fs.ErrInvalid)` and creates no
+target. A backup path that does not exist or is not a directory, and a target
+path that already exists and is non-empty (including a regular file), are
+rejected with the same error. The restored directory, once reopened, is
+byte-for-byte the state a full replay reaches at the export watermark: batch
+atomicity and within-batch last-write-wins ordering and the cumulative
+snapshot count are all preserved.
+
+Both export and import are all-or-nothing: a process killed at any instant
+leaves either the previous contents or one complete result, never a
+half-populated directory. Segments and the manifest are built and fsynced in a
+`backup.tmp` staging directory and promoted one at a time; a restore builds the
+complete store in a temporary sibling and renames it into place only once it is
+fully durable. Residual temporary files are swept at the start of the next
+backup into that directory or the next open of a related directory, and a store
+that is backed up is never modified by the export. A reopened restored
+directory already holds the complete committed state — no further export or
+compaction is needed to use it, and the cumulative snapshot count is not reset.
+
+`Backup` on a closed store returns an error satisfying
+`errors.Is(err, fs.ErrClosed)`. Backup never copies the WAL or checkpoint
+layout: the artifact is a self-contained, versioned snapshot of the data, not a
+duplicate of the on-disk internals.
 
 ## Tests
 
