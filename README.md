@@ -23,6 +23,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
 - `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to an existing backup chain.
+- `(*Store).MergeChain(chainDir string, rings int) error` folds the head and the first rings into a new full head and retires those rings.
 - `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (a lone full artifact or a full head plus its incremental rings) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
@@ -282,6 +283,57 @@ valid head, or is itself damaged is rejected wholesale with
 `errors.Is(err, fs.ErrInvalid)` and leaves no partial ring;
 `BackupIncremental` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
+
+### On-demand chain merging
+
+`MergeChain(chainDir, rings)` folds the full chain head together with the
+first `rings` incremental rings into one fresh full head and retires those
+rings; every later ring stays on the chain, renumbered into a dense 1-based
+sequence linked to the new head. The merge result is the complete committed
+state at the watermark of that last folded ring — exactly what restoring the
+old chain reached there — with keys and values and the cumulative snapshot
+count preserved verbatim. Batches stay visible as whole batches with
+within-batch last-write-wins intact, and a delete covered by a folded ring
+never exposes its old value again: the merged head carries live keys only,
+like every full backup.
+
+The new head keeps the existing format version, export-watermark and
+cumulative-snapshot vocabulary and the same whole-artifact checksums; the
+surviving rings keep their entry bytes, watermarks and cumulative counts with
+their index, backward link and the CRCs that cover them rewritten. The merged
+chain therefore still passes the existing whole-chain restore validation:
+ring numbering is dense, watermarks meet end to end, and a ring appended
+afterwards links to the new head exactly as before. The folded rings are
+deleted as soon as the new chain is committed, so the directory stops holding
+them.
+
+The merge is segmented and streams the whole way: a k-way merge over the head
+and the folded rings feeds the new head in bounded chunks, and each surviving
+ring is re-validated and re-streamed one entry at a time, so the entire
+keyspace is never copied into memory before landing. It neither modifies the
+backed-up store nor takes its lock, so writes, batch commits, snapshot
+open/close, cursor paging, checkpoints, compaction and incremental exports
+proceed while it runs and never block one another; reads keep hitting memory.
+An incremental export and a merge issued by the same store serialize so they
+can never overwrite each other or leave half a ring or half a chain.
+
+The new chain is built and synced in a sibling `<chain>.merge.tmp` staging
+directory, then installed with two directory renames: the live chain is parked
+as `<chain>.merge.obs`, the staged chain is renamed into its place and the
+parked copy is dropped. A kill at any instant therefore leaves either the old
+chain or the complete new chain — a kill between the renames is healed by
+renaming the parked chain back — and residual staging files are swept at the
+next merge or backup into that directory, the next restore of it, or the next
+open of a related directory. A snapshot taken against the backed-up store and
+the state a restore reaches are byte-identical before and after a merge.
+
+A `rings` count below one or above the number of rings present, a chain
+directory that does not exist, a missing usable head, a missing ring, a broken
+or discontinuous chain, a truncated ring, a checksum mismatch or an unknown
+format version rejects the whole operation with
+`errors.Is(err, fs.ErrInvalid)` and leaves the chain exactly as it was, with
+no half ring or half chain. `MergeChain` on a closed store returns an error
+satisfying `errors.Is(err, fs.ErrClosed)`.
 
 ## Tests
 

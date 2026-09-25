@@ -387,6 +387,7 @@ func streamHeadSegments(backupDir string, head manifestInfo, cb ringEntryCallbac
 type artifactInfo struct {
 	head      manifestInfo
 	ringCount uint32 // number of rings dense after the head
+	rings     []ringSummary
 	tipCRC    uint32 // content CRC the next ring must link to
 	endWM     uint64 // watermark of the chain tip
 	snaps     uint64 // cumulative snapshot count at the chain tip
@@ -468,6 +469,7 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 	prevSnaps := head.snaps
 	prevLink := head.crc
 	tipCRC := head.crc
+	rings := make([]ringSummary, 0, ringCount)
 	for idx := uint32(1); idx <= ringCount; idx++ {
 		f, oerr := os.Open(filepath.Join(backupDir, ringName(idx)))
 		if oerr != nil {
@@ -485,6 +487,7 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 		if sum.snaps < prevSnaps {
 			return zero, errBadBackup
 		}
+		rings = append(rings, sum)
 		prevWM = sum.endWM
 		prevSnaps = sum.snaps
 		prevLink = sum.fileCRC
@@ -493,6 +496,7 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 	return artifactInfo{
 		head:      head,
 		ringCount: ringCount,
+		rings:     rings,
 		tipCRC:    tipCRC,
 		endWM:     prevWM,
 		snaps:     prevSnaps,
@@ -675,6 +679,11 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	}
 	if chainDir == "" {
 		return errBadBackup
+	}
+	// Heal or clear debris of a chain merge killed around its swap before the
+	// chain path is inspected, so a parked chain is restored into place first.
+	if err := sweepMergeLeftovers(chainDir); err != nil {
+		return err
 	}
 	info, err := os.Stat(chainDir)
 	if err != nil {

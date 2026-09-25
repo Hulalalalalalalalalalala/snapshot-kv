@@ -130,8 +130,23 @@ func (s *Store) Backup(outDir string) error {
 	if s.closed.Load() {
 		return errStoreClosed
 	}
+	// Serialize exports and chain merges driven by this store so they never
+	// share a staging directory or install over one another. This never
+	// serializes with commits or lock-free reads; it is released while the
+	// anchor is taken and is independent of the store lock.
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	if s.closed.Load() {
+		return errStoreClosed
+	}
 	if outDir == "" {
 		return errBadBackup
+	}
+
+	// Heal or clear debris of a chain merge killed around its swap before the
+	// output path is inspected, so a parked chain is restored into place first.
+	if err := sweepMergeLeftovers(outDir); err != nil {
+		return err
 	}
 
 	// Prepare the output directory and clear debris from an export killed
@@ -345,7 +360,7 @@ func writeBackup(outDir string, anchor backupAnchor) error {
 	// The manifest is the commit point: it names exactly the durable segment
 	// set and carries the artifact metadata. Building it last makes the whole
 	// export all-or-nothing.
-	if err := writeManifest(outDir, stage, anchor, total, segments); err != nil {
+	if _, err := writeManifest(outDir, stage, anchor, total, segments); err != nil {
 		cleanup()
 		return err
 	}
@@ -452,20 +467,21 @@ type manifestSegment struct {
 
 // writeManifest builds and durably installs the manifest, the export's commit
 // point. It is written under a temp name in the staging directory, synced,
-// renamed into outDir and followed by a directory force.
-func writeManifest(outDir, stage string, anchor backupAnchor, total uint64, segs []manifestSegment) error {
+// renamed into outDir and followed by a directory force. It returns the
+// manifest's terminal content CRC, which the first ring of a chain links to.
+func writeManifest(outDir, stage string, anchor backupAnchor, total uint64, segs []manifestSegment) (uint32, error) {
 	if err := os.MkdirAll(stage, 0o700); err != nil {
-		return err
+		return 0, err
 	}
 	tmpPath := filepath.Join(stage, backupManifestTmp)
 	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	fail := func(err error) error {
+	fail := func(err error) (uint32, error) {
 		tmp.Close()
 		os.Remove(tmpPath)
-		return err
+		return 0, err
 	}
 
 	w := bufio.NewWriter(tmp)
@@ -493,8 +509,9 @@ func writeManifest(outDir, stage string, anchor backupAnchor, total uint64, segs
 		}
 		h.Write(rec)
 	}
+	crc := h.Sum32()
 	var crcb [crcSize]byte
-	binary.LittleEndian.PutUint32(crcb[:], h.Sum32())
+	binary.LittleEndian.PutUint32(crcb[:], crc)
 	if _, err := w.Write(crcb[:]); err != nil {
 		return fail(err)
 	}
@@ -506,13 +523,16 @@ func writeManifest(outDir, stage string, anchor backupAnchor, total uint64, segs
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpPath)
-		return err
+		return 0, err
 	}
 	if err := os.Rename(tmpPath, filepath.Join(outDir, backupManifest)); err != nil {
 		os.Remove(tmpPath)
-		return err
+		return 0, err
 	}
-	return syncDirectory(outDir)
+	if err := syncDirectory(outDir); err != nil {
+		return 0, err
+	}
+	return crc, nil
 }
 
 // sweepBackupDebris removes temporary files an export killed before its commit

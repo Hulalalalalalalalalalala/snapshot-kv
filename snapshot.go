@@ -175,6 +175,12 @@ func Open(dir string) (*Store, error) {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
+		// Heal a chain merge killed between its two swap renames before
+		// creating anything: a parked <dir>.merge.obs is the live chain and is
+		// renamed back onto dir. With no parked sibling this is a no-op.
+		if err := sweepMergeLeftovers(dir); err != nil {
+			return nil, err
+		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
@@ -198,6 +204,12 @@ func Open(dir string) (*Store, error) {
 	// from a restore killed before its target rename. These names never appear
 	// in a live store, so a store that was merely backed up is unaffected.
 	if err := openBackupSweep(dir); err != nil {
+		return nil, err
+	}
+	// Heal or clear debris of a chain merge killed around its directory swap.
+	// The debris is a sibling of dir named after dir, so opening an unrelated
+	// store never touches another directory's merge.
+	if err := sweepMergeLeftovers(dir); err != nil {
 		return nil, err
 	}
 	sweepRestoreDebris(dir)

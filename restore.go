@@ -37,6 +37,12 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 		return nil, errBadBackup
 	}
 
+	// Heal or clear debris of a chain merge killed around its swap before the
+	// backup path is inspected, so a chain parked by a kill is restored.
+	if err := sweepMergeLeftovers(backupDir); err != nil {
+		return nil, err
+	}
+
 	// The artifact itself must be an existing directory whose only entries are
 	// the manifest and the segments it names.
 	binfo, err := os.Stat(backupDir)
