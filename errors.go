@@ -24,4 +24,16 @@ var (
 		errors.New("snapshot: cursor continuation offset or limit is invalid"),
 		fs.ErrInvalid,
 	)
+	errBackupInvalid = errors.Join(
+		errors.New("snapshot: backup is incomplete or corrupt"),
+		fs.ErrInvalid,
+	)
+	errBackupTarget = errors.Join(
+		errors.New("snapshot: backup directory is not usable"),
+		fs.ErrInvalid,
+	)
+	errRestoreTarget = errors.Join(
+		errors.New("snapshot: restore target already holds store data"),
+		fs.ErrInvalid,
+	)
 )

@@ -13,12 +13,14 @@ import (
 )
 
 // viewFlattenLimit bounds how deep an overlay chain a published view grows
-// before the next commit builds it on a flattened copy. Without a bound the
-// chain would gain one map per commit for the life of the store and memory
-// would track cumulative commits; flattening every viewFlattenLimit commits
-// keeps live depth (and the work a read or checkpoint walk does) independent
-// of commit count, while the flattened copies stay immutable for every
-// snapshot already holding an older view.
+// before the next commit collapses the stacked overlays into one. Without a
+// bound the chain would gain one map per commit for the life of the store and
+// memory would track cumulative commits; collapsing every viewFlattenLimit
+// commits keeps live depth (and the work a read or checkpoint walk does)
+// independent of commit count. Collapsing merges only the keys the stacked
+// commits touched — allocation follows the commits' own keys, never the live
+// key count — and the merged-out overlays stay immutable for every snapshot
+// already holding an older view.
 const viewFlattenLimit = 64
 
 // node is one immutable version in a key's history. Versions form a linked
@@ -40,9 +42,10 @@ type node struct {
 // of overlays; the current view, snapshots and cursors simply point at one.
 //
 // A view's keys map may itself hold the whole keyspace: the base layer
-// (base == nil) used by recovery, compaction and periodic flattening. Maps
-// are never mutated after publication, so reading them needs no lock; only
-// the commit path, which has just created a fresh overlay, writes its keys.
+// (base == nil) used by recovery, compaction and the collapsed chain's
+// bottom. Maps are never mutated after publication, so reading them needs no
+// lock; only the commit path, which has just created a fresh overlay, writes
+// its keys.
 type view struct {
 	keys  map[string]*node
 	base  *view
@@ -86,16 +89,29 @@ func (v *view) rangeEach(fn func(key string, n *node) bool) {
 	}
 }
 
-// flatten materializes one flat map holding the view's complete terminal
-// state. It allocates a fresh map and shares only immutable nodes, so views
-// already published stay untouched.
-func (v *view) flatten() *view {
-	flat := newView(nil)
-	v.rangeEach(func(k string, n *node) bool {
-		flat.keys[k] = n
-		return true
-	})
-	return flat
+// collapse merges every overlay above the chain's bottom view into a single
+// overlay, bounding live chain depth. Only the overlays' own entries are
+// copied — the bottom view's map is shared untouched — so the allocation
+// tracks the keys the merged commits touched, not the live key count, and
+// repeated collapses never accumulate temporary occupancy proportional to
+// the keyspace. Views already published stay immutable and keep serving
+// their exact state.
+func (v *view) collapse() *view {
+	bottom := v
+	var overlays []*view
+	for bottom.base != nil {
+		overlays = append(overlays, bottom)
+		bottom = bottom.base
+	}
+	// overlays runs newest to oldest; apply oldest first so the newest
+	// version of each key wins.
+	merged := make(map[string]*node)
+	for i := len(overlays) - 1; i >= 0; i-- {
+		for k, n := range overlays[i].keys {
+			merged[k] = n
+		}
+	}
+	return &view{keys: merged, base: bottom, depth: 2}
 }
 
 // Store is an open key-value store backed by a directory on disk.
@@ -154,6 +170,11 @@ type Store struct {
 type Snapshot struct {
 	v     atomic.Pointer[view] // nil once the snapshot is closed
 	store *Store               // back-reference for cursor pin accounting
+
+	// seq and snaps are the commit watermark and cumulative snapshot count
+	// at acquisition; Backup exports them with the fixed view.
+	seq   uint64
+	snaps uint64
 }
 
 // Open opens or creates a persistent store in dir. A path that names a
@@ -544,10 +565,12 @@ func (s *Store) commitGroup(group []*pendingBatch) []error {
 		// batch's overlay, so the view it publishes is a valid point-in-time
 		// state independent of later batches, and queued batches cost memory
 		// proportional to their own ops rather than the whole live keyspace.
-		// When the chain has grown deep, flatten first so live depth stays
-		// bounded by viewFlattenLimit instead of cumulative commit count.
+		// When the chain has grown deep, the stacked overlays are collapsed
+		// into one first, so live depth stays bounded by viewFlattenLimit and
+		// the merge cost follows only the keys those commits touched, never
+		// the live key count, however often commits queue up.
 		if base.depth >= viewFlattenLimit {
-			base = base.flatten()
+			base = base.collapse()
 		}
 		v := newView(base)
 		var changes []batchChange
@@ -986,7 +1009,7 @@ func (s *Store) Snapshot() (*Snapshot, error) {
 		s.snapshots.Add(^uint64(0))
 		return nil, err
 	}
-	snap := &Snapshot{store: s}
+	snap := &Snapshot{store: s, seq: s.nextSeq, snaps: count}
 	snap.v.Store(s.current.Load())
 	return snap, nil
 }
