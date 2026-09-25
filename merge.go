@@ -72,6 +72,14 @@ var errMergeAbort = errors.New("snapshot: merge stream aborted")
 // the next merge, backup or export into that directory or the next open of a
 // related directory.
 //
+// The merge takes the chain directory's lease before touching anything, so
+// concurrent exports, merges and restores on the same chain directory — from
+// this store, another store or another process — are mutually exclusive: at
+// most one registered operation advances the chain at a time. A merge that
+// cannot take the lease fails wholesale with an error wrapping fs.ErrInvalid
+// and leaves the chain exactly as it was; a lease left behind by a killed
+// holder is reclaimed, never waited on.
+//
 // A ring count below one or beyond the chain's ring count, a chain directory
 // that is missing, not a directory, missing its head, or itself damaged (a
 // missing ring, a broken link, a non-continuous watermark, truncation, a
@@ -95,6 +103,15 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 	if chainDir == "" || rings < 1 {
 		return errBadBackup
 	}
+	// Coordinate with every other operation on this chain directory, in this
+	// process or another: only the lease holder may repair debris, validate
+	// the chain and swap a merged chain into place. A live holder fails the
+	// whole merge; a killed holder's lease is reclaimed.
+	lease, err := acquireChainLease(chainDir)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
 	// Repair or clear debris from a merge killed mid-commit before inspecting
 	// the chain, exactly as the next backup or open of the directory would.
 	sweepMergeDebris(chainDir)

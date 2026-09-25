@@ -662,6 +662,14 @@ type ringEntryKind struct {
 // (staging debris is swept at the next export into, or Open of, the
 // directory), and the backed-up store is never modified.
 //
+// The export takes the chain directory's lease before touching anything, so
+// concurrent exports, merges and restores on the same chain directory — from
+// this store, another store or another process — are mutually exclusive: at
+// most one registered operation advances the chain at a time. An export that
+// cannot take the lease fails wholesale with an error wrapping fs.ErrInvalid
+// and leaves no partial ring; a lease left behind by a killed holder is
+// reclaimed, never waited on.
+//
 // A chain directory that is missing, not a directory, incomplete or damaged
 // (a missing ring, a broken link, a non-continuous watermark, truncation,
 // checksum failure or unknown version), or a chain advanced concurrently
@@ -683,6 +691,15 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	if chainDir == "" {
 		return errBadBackup
 	}
+	// Coordinate with every other operation on this chain directory, in this
+	// process or another: only the lease holder may repair debris, validate
+	// the chain and append a ring. A live holder fails the whole export; a
+	// killed holder's lease is reclaimed.
+	lease, err := acquireChainLease(chainDir)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
 	// Repair or clear debris from a merge killed mid-commit before inspecting
 	// the chain.
 	sweepMergeDebris(chainDir)
@@ -742,6 +759,16 @@ func (s *Store) BackupIncremental(chainDir string) error {
 		return errBadBackup
 	}
 	touched := collectTouchedKeys(anchor.view, prevPresent, startWM, anchor.watermark)
+	// Every entry must be orderable strictly inside (startWM, endWM]: a
+	// tombstone synthesized for a forgotten key is stamped at the anchor, so
+	// when the anchor did not advance past the tip this store cannot
+	// represent that delete on the chain at all. Reject the export wholesale
+	// rather than write a ring no validation would accept.
+	for _, e := range touched {
+		if e.seq <= startWM || e.seq > anchor.watermark {
+			return errBadBackup
+		}
+	}
 
 	index := art.ringCount + 1
 	return writeIncrementalRing(chainDir, ringHeader{

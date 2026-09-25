@@ -122,6 +122,14 @@ type backupEntry struct {
 // outDir — staging debris is swept at the start of the next Backup there (or
 // the next Open of that directory) and never affects the backed-up store.
 //
+// The export takes the chain directory's lease before touching anything, so
+// concurrent exports, merges and restores on the same chain directory —
+// from this store, another store or another process — are mutually
+// exclusive: at most one registered operation advances the chain at a time.
+// An export that cannot take the lease fails wholesale with an error
+// wrapping fs.ErrInvalid; a lease left behind by a killed holder is
+// reclaimed, never waited on.
+//
 // A path that does not exist or is not a directory, or a directory that
 // already holds a complete or partial artifact or any unrelated entry, is
 // rejected with an error wrapping fs.ErrInvalid. Backup on a closed store
@@ -134,6 +142,19 @@ func (s *Store) Backup(outDir string) error {
 		return errBadBackup
 	}
 
+	// Coordinate with every other operation on this chain directory, in this
+	// process or another: only the lease holder may repair debris, clear
+	// staging and write an artifact here. A live holder fails the whole
+	// export; a killed holder's lease is reclaimed. The parent directory is
+	// created first so the lease file has somewhere to live.
+	if err := os.MkdirAll(filepath.Dir(outDir), 0o700); err != nil {
+		return err
+	}
+	lease, err := acquireChainLease(outDir)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
 	// Prepare the output directory and clear debris from an export killed
 	// mid-run, before touching the store. A finished artifact or any foreign
 	// entry is never overwritten. Debris from a chain merge killed mid-commit

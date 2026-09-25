@@ -322,6 +322,33 @@ during the merge, rejects the whole operation with an error satisfying
 `MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
+### Chain directory coordination
+
+A chain directory can be shared by several store objects, in one process or
+across processes, so every operation that works on it — `Backup`,
+`BackupIncremental`, `MergeChain` and `Restore` — first takes the chain's
+**lease**: a small sibling file (`<chain>.lease`) naming its holder (a
+process id plus a random token) and carrying an expiry time. At most one
+registered operation holds the lease at a time, so concurrent exports,
+merges and restores on the same chain directory are mutually exclusive and
+the chain is at every instant either the old chain or the complete new one,
+never an in-between mixture.
+
+The lease is never waited on: an operation that cannot take it fails
+wholesale with an error satisfying `errors.Is(err, fs.ErrInvalid)` and
+touches nothing on or around the chain. A holder that is force-killed leaves
+the lease file behind, and the next backup, merge, restore or open of a
+related directory recognizes it as stale — the holder process is gone or its
+expiry has passed — reclaims it and proceeds; a live holder renews its
+expiry for as long as it runs, so a slow export or merge is never reclaimed
+from under itself. The chain is therefore never wedged behind a dead holder
+and needs no manual cleanup. The lease file lives next to the chain
+directory, not inside it, so it is never part of the validated artifact.
+
+Coordination changes nothing about the store itself: writes, batch commits,
+snapshot open/close, cursor paging, checkpoints, compactions and lock-free
+reads proceed while a lease is held, exactly as before.
+
 ## Tests
 
     go test ./...
