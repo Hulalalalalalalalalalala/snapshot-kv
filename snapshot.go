@@ -139,6 +139,12 @@ type Store struct {
 	queue     []*pendingBatch
 	committer bool
 
+	// backupMu serializes exports that stage into one chain directory
+	// (BackupIncremental) so two exports on this store never share their
+	// staging directory. It is independent of mu: it is held across the
+	// export's disk I/O and never blocks commits or lock-free reads.
+	backupMu sync.Mutex
+
 	// Test hook, nil outside tests. leaderHook runs once after a commit has
 	// become leader, before its first queue drain, and lets tests hold a
 	// leader until a known number of commits have coalesced.

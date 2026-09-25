@@ -301,6 +301,21 @@ func TestBackupConcurrentWithCommits(t *testing.T) {
 		}(g)
 	}
 
+	// Wait until the writers' first commit is visible before exporting, so no
+	// backup anchors at a watermark that legitimately predates "shared".
+	deadline0 := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok, _ := s.Get("shared"); ok {
+			break
+		}
+		if time.Now().After(deadline0) {
+			close(stop)
+			wg.Wait()
+			t.Fatal("writers never committed")
+		}
+		runtime.Gosched()
+	}
+
 	// Several backups run while writes flow; each must succeed and restore to
 	// a self-consistent state, and the reads never block on the export.
 	var backups []string

@@ -180,23 +180,25 @@ func prepareBackupDir(outDir string) error {
 	for _, e := range entries {
 		name := e.Name()
 		switch {
-		case e.IsDir() && name == backupStageDir:
+		case e.IsDir() && (name == backupStageDir || name == incrStageDir):
 			// staging debris, removed below
-		case !e.IsDir() && (isBackupSegmentName(name) || name == backupManifestTmp):
+		case !e.IsDir() && (isBackupSegmentName(name) || isBackupRingName(name) || name == backupManifestTmp):
 			// orphaned by a kill, removed below
 		default:
 			return errBadBackup
 		}
 	}
-	if err := os.RemoveAll(filepath.Join(outDir, backupStageDir)); err != nil {
-		return err
+	for _, stage := range []string{backupStageDir, incrStageDir} {
+		if err := os.RemoveAll(filepath.Join(outDir, stage)); err != nil {
+			return err
+		}
 	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		if isBackupSegmentName(name) || name == backupManifestTmp {
+		if isBackupSegmentName(name) || isBackupRingName(name) || name == backupManifestTmp {
 			if err := os.Remove(filepath.Join(outDir, name)); err != nil &&
 				!errors.Is(err, os.ErrNotExist) {
 				return err
@@ -204,6 +206,12 @@ func prepareBackupDir(outDir string) error {
 		}
 	}
 	return syncDirectory(outDir)
+}
+
+// isBackupRingName reports whether name is a finished incremental ring file.
+func isBackupRingName(name string) bool {
+	_, ok := parseRingIndex(name)
+	return ok
 }
 
 // isBackupSegmentName reports whether name is a finished segment file name.
@@ -430,6 +438,7 @@ type manifestInfo struct {
 	watermark uint64
 	snaps     uint64
 	total     uint64
+	crc       uint32 // manifest terminal content CRC; the first ring links to it
 	segments  []manifestSegment
 }
 
@@ -507,13 +516,16 @@ func writeManifest(outDir, stage string, anchor backupAnchor, total uint64, segs
 }
 
 // sweepBackupDebris removes temporary files an export killed before its commit
-// point can leave in a directory: its staging directory and a manifest temp.
-// Finished segment files are left here (only the next backup into that
-// directory reclaims them); the manifest, when present, is never touched.
+// point can leave in a directory: the full and incremental staging
+// directories and a manifest temp. Finished segment and ring files are left
+// here (only the next backup into that directory reclaims them); the manifest,
+// when present, is never touched.
 func sweepBackupDebris(dir string) error {
-	if err := os.RemoveAll(filepath.Join(dir, backupStageDir)); err != nil &&
-		!errors.Is(err, os.ErrNotExist) {
-		return err
+	for _, stage := range []string{backupStageDir, incrStageDir} {
+		if err := os.RemoveAll(filepath.Join(dir, stage)); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if err := os.Remove(filepath.Join(dir, backupManifestTmp)); err != nil &&
 		!errors.Is(err, os.ErrNotExist) {

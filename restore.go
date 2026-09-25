@@ -47,14 +47,32 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 		return nil, errBadBackup
 	}
 
-	manifest, err := loadBackupManifest(backupDir)
+	// When incremental rings extend the head artifact, the whole chain is
+	// validated up front (missing rings, broken links, discontinuous
+	// watermarks, truncation, checksum failures and unknown versions reject
+	// the entire directory); a head-only artifact keeps its original path.
+	hasRings, err := dirHasRings(backupDir)
 	if err != nil {
-		// Content defects already wrap fs.ErrInvalid; an underlying read
-		// failure passes through unchanged.
 		return nil, err
 	}
-	if err := verifyBackupFileSet(backupDir, manifest.segments); err != nil {
-		return nil, err
+	var chain artifactInfo
+	var manifest manifestInfo
+	if hasRings {
+		chain, err = validateBackupChain(backupDir)
+		if err != nil {
+			return nil, err
+		}
+		manifest = chain.head
+	} else {
+		manifest, err = loadBackupManifest(backupDir)
+		if err != nil {
+			// Content defects already wrap fs.ErrInvalid; an underlying read
+			// failure passes through unchanged.
+			return nil, err
+		}
+		if err := verifyBackupFileSet(backupDir, manifest.segments); err != nil {
+			return nil, err
+		}
 	}
 
 	// The target must be absent or an empty directory.
@@ -80,7 +98,12 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 		}
 	}()
 
-	if err := buildRestoredStore(stage, backupDir, manifest); err != nil {
+	if hasRings {
+		err = buildChainRestoredStore(stage, backupDir, chain)
+	} else {
+		err = buildRestoredStore(stage, backupDir, manifest)
+	}
+	if err != nil {
 		// Artifact validation failures already wrap fs.ErrInvalid; a genuine
 		// write failure is reported as-is rather than mislabeled invalid.
 		return nil, err
@@ -249,6 +272,7 @@ func loadBackupManifest(backupDir string) (manifestInfo, error) {
 	if binary.LittleEndian.Uint32(crcb[:]) != h.Sum32() {
 		return zero, errBadBackup
 	}
+	info.crc = binary.LittleEndian.Uint32(crcb[:])
 	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
 		return zero, errBadBackup // trailing bytes, or an underlying read error
 	}
@@ -454,7 +478,13 @@ func openBackupSweep(dir string) error {
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && isBackupSegmentName(e.Name()) {
+		if e.IsDir() {
+			continue
+		}
+		if isBackupSegmentName(e.Name()) {
+			names = append(names, e.Name())
+		}
+		if _, ok := parseRingIndex(e.Name()); ok {
 			names = append(names, e.Name())
 		}
 	}

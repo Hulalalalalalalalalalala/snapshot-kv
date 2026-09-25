@@ -22,7 +22,8 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Checkpoint() error` freezes complete committed state for a fast reopen.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
-- `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup into a fresh directory and returns it open.
+- `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to an existing backup chain.
+- `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (a lone full artifact or a full head plus its incremental rings) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
 
@@ -229,6 +230,58 @@ compaction is needed to use it, and the cumulative snapshot count is not reset.
 `errors.Is(err, fs.ErrClosed)`. Backup never copies the WAL or checkpoint
 layout: the artifact is a self-contained, versioned snapshot of the data, not a
 duplicate of the on-disk internals.
+
+### Incremental backup chains
+
+`BackupIncremental(chainDir)` extends a backup chain that already starts with a
+complete `Backup` artifact in `chainDir`: the full export is the chain head,
+and each call appends one self-describing **ring** (`incr-0000000001.dat`,
+`incr-0000000002.dat`, …) covering only the terminal state of keys touched
+between the previous ring's watermark and a fresh fixed anchor. A ring records
+later puts as values and keys deleted in the interval as tombstones — keys
+touched several times appear once, in their terminal state; keys deleted and
+since forgotten entirely by a compaction are still recorded as tombstones, so
+a delete is never resurrected by later compaction of the backed-up store. The
+ring anchors at one fixed watermark exactly like a full backup: writes and
+deletes committed after the anchor do not enter it, and the foreground keeps
+committing while the ring streams out. A ring with no touched keys is a legal
+empty ring that still advances the cumulative snapshot count.
+
+Rings share the head's format version, watermark and cumulative-snapshot
+vocabulary: each ring header carries the format version, its 1-based ring
+index, a content-CRC link to the artifact before it (the head manifest for
+ring 1, the preceding ring's file CRC afterwards), the watermark it starts
+from (exclusive) and ends at (inclusive), and the cumulative snapshot count at
+that point. Its entries flow in bounded segments, each self-describing and
+independently CRC-protected, and the ring finishes with a chained segment CRC
+and a whole-file CRC.
+
+`Restore` accepts both a lone full artifact and a head plus its rings: when
+rings are present the **whole chain is validated first** and the result is
+synthesized by applying the head and then the rings in chain order, each ring
+overriding the one before it, so a key deleted in a later ring reads back as a
+miss. A missing ring, a gap in the dense ring sequence, a broken predecessor
+link, a non-continuous watermark, a truncated ring or segment, a checksum
+mismatch, an unknown format version, or a foreign/stray file rejects the
+entire chain with an error satisfying `errors.Is(err, fs.ErrInvalid)`, and no
+target is created — half a chain is never installed. The head-only path and
+its on-disk format are unchanged. The restored directory, reopened, is
+byte-for-byte the state a full replay reaches at the last ring's watermark,
+with batch semantics and the cumulative snapshot count intact.
+
+`BackupIncremental` streams in bounded chunks and never copies the keyspace
+into memory before writing; export and synthesis do not block writes,
+deletes, batch commits, snapshot open/close, cursor paging, checkpoints or
+compaction, and reads keep hitting memory. The ring is built and synced in an
+`incr.tmp` staging directory and linked into place (a link never overwrites),
+so a kill at any instant leaves either the previous chain or the chain
+extended by one complete ring; staging debris is swept at the next export into
+that directory or the next open of it, and the backed-up store is never
+modified. A chain directory that does not exist, is not a directory, holds no
+valid head, or is itself damaged is rejected wholesale with
+`errors.Is(err, fs.ErrInvalid)` and leaves no partial ring;
+`BackupIncremental` on a closed store returns an error satisfying
+`errors.Is(err, fs.ErrClosed)`.
 
 ## Tests
 
