@@ -195,6 +195,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	sweepRestoreDebris(dir)
+	sweepIncrementalDebris(dir)
 
 	latest := newView(nil)
 	var replaySeq uint64

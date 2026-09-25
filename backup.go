@@ -137,6 +137,7 @@ func (s *Store) Backup(outDir string) error {
 	// Prepare the output directory and clear debris from an export killed
 	// mid-run, before touching the store. A finished artifact or any foreign
 	// entry is never overwritten.
+	sweepIncrementalDebris(outDir)
 	info, err := os.Stat(outDir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {

@@ -302,7 +302,16 @@ func TestBackupConcurrentWithCommits(t *testing.T) {
 	}
 
 	// Several backups run while writes flow; each must succeed and restore to
-	// a self-consistent state, and the reads never block on the export.
+	// a self-consistent state, and the reads never block on the export. Wait
+	// for the first writer batch to commit first: a backup may legitimately
+	// anchor before any writer commits, and only states at or after the first
+	// writer batch contain "shared".
+	for {
+		if _, ok, _ := s.Get("shared"); ok {
+			break
+		}
+		runtime.Gosched()
+	}
 	var backups []string
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

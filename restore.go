@@ -11,17 +11,21 @@ import (
 	"sort"
 )
 
-// Restore loads a backup artifact produced by Store.Backup from backupDir and
-// installs a ready-to-open store into targetDir, returning it already open.
-// The restored directory, once reopened, is byte-for-byte the complete
-// committed state at the export watermark: a full replay from it yields the
-// same terminal state the backup captured, and the cumulative snapshot count
-// is preserved exactly.
+// Restore loads a backup chain produced by Store.Backup (the chain head) and
+// zero or more Store.BackupIncremental rings from backupDir and installs a
+// ready-to-open store into targetDir, returning it already open. The restored
+// directory, once reopened, is byte-for-byte the complete committed state at
+// the chain's last export watermark: a full replay from it yields the same
+// terminal state the chain captures, and the cumulative snapshot count is
+// preserved exactly. A plain full backup with no rings restores exactly as
+// before.
 //
-// The artifact is validated as one whole before anything is installed: a
-// missing segment, a truncated segment, a checksum mismatch, an unknown format
-// version or a manifest that disagrees with the files rejects the entire
-// backup with an error wrapping fs.ErrInvalid, and no target is created.
+// The chain is validated as one whole before anything is installed: a missing
+// segment or ring, a gap in the ring numbering, a truncated segment, a
+// checksum mismatch, an unknown format version, a watermark that does not
+// continue the chain or a manifest that disagrees with the files rejects the
+// entire backup with an error wrapping fs.ErrInvalid, and no target is
+// created.
 //
 // Installation is all-or-nothing: the new store is fully built and synced in a
 // temporary sibling directory and only then renamed onto targetDir. A process
@@ -47,13 +51,10 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 		return nil, errBadBackup
 	}
 
-	manifest, err := loadBackupManifest(backupDir)
+	head, rings, err := loadChain(backupDir)
 	if err != nil {
 		// Content defects already wrap fs.ErrInvalid; an underlying read
 		// failure passes through unchanged.
-		return nil, err
-	}
-	if err := verifyBackupFileSet(backupDir, manifest.segments); err != nil {
 		return nil, err
 	}
 
@@ -80,7 +81,12 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 		}
 	}()
 
-	if err := buildRestoredStore(stage, backupDir, manifest); err != nil {
+	if len(rings) == 0 {
+		err = buildRestoredStore(stage, backupDir, head)
+	} else {
+		err = buildSynthesizedStore(stage, backupDir, head, rings)
+	}
+	if err != nil {
 		// Artifact validation failures already wrap fs.ErrInvalid; a genuine
 		// write failure is reported as-is rather than mislabeled invalid.
 		return nil, err
@@ -176,22 +182,35 @@ func readFull(r io.Reader, buf []byte) error {
 
 // loadBackupManifest reads and fully validates manifest.dat.
 func loadBackupManifest(backupDir string) (manifestInfo, error) {
+	info, _, err := loadManifestFile(filepath.Join(backupDir, backupManifest), false)
+	return info, err
+}
+
+// loadManifestFile reads and fully validates one manifest file. A ring
+// manifest (ring is true) carries one extra header field, the base watermark
+// the ring continues from, and that value is returned as well; a head
+// manifest reports base 0.
+func loadManifestFile(path string, ring bool) (manifestInfo, uint64, error) {
 	var zero manifestInfo
-	f, err := os.Open(filepath.Join(backupDir, backupManifest))
+	f, err := os.Open(path)
 	if err != nil {
 		// A missing manifest means the export never reached its commit point:
 		// the artifact is incomplete, not a transient I/O failure.
 		if errors.Is(err, os.ErrNotExist) {
-			return zero, errBadBackup
+			return zero, 0, errBadBackup
 		}
-		return zero, err
+		return zero, 0, err
 	}
 	defer f.Close()
 
 	r := bufio.NewReader(f)
-	head := make([]byte, backupManifestSize)
+	headerSize := backupManifestSize
+	if ring {
+		headerSize = backupRingManifestSize
+	}
+	head := make([]byte, headerSize)
 	if err := readFull(r, head); err != nil {
-		return zero, err
+		return zero, 0, err
 	}
 	h := crc32.NewIEEE()
 	h.Write(head)
@@ -199,20 +218,26 @@ func loadBackupManifest(backupDir string) (manifestInfo, error) {
 	magic := binary.LittleEndian.Uint32(head[0:4])
 	version := binary.LittleEndian.Uint32(head[4:8])
 	if magic != backupMagic || version != backupVersion {
-		return zero, errBadBackup
+		return zero, 0, errBadBackup
 	}
 	info := manifestInfo{
 		watermark: binary.LittleEndian.Uint64(head[8:16]),
 		snaps:     binary.LittleEndian.Uint64(head[16:24]),
-		total:     binary.LittleEndian.Uint64(head[24:32]),
 	}
-	n := binary.LittleEndian.Uint32(head[32:36])
+	off := 24
+	var base uint64
+	if ring {
+		base = binary.LittleEndian.Uint64(head[24:32])
+		off = 32
+	}
+	info.total = binary.LittleEndian.Uint64(head[off : off+8])
+	n := binary.LittleEndian.Uint32(head[off+8 : off+12])
 	// Every segment carries at least one entry, so the segment count never
 	// exceeds the entry total; an empty artifact has n == 0 and total == 0.
 	// The absolute cap only guards the pre-allocation against a forged count;
 	// the record loop rejects an artifact that does not actually contain them.
 	if uint64(n) > info.total || n > backupMaxSegments {
-		return zero, errBadBackup
+		return zero, 0, errBadBackup
 	}
 
 	rec := make([]byte, backupSegRecSize)
@@ -220,7 +245,7 @@ func loadBackupManifest(backupDir string) (manifestInfo, error) {
 	info.segments = make([]manifestSegment, 0, n)
 	for i := uint32(0); i < n; i++ {
 		if err := readFull(r, rec); err != nil {
-			return zero, err
+			return zero, 0, err
 		}
 		h.Write(rec)
 		s := manifestSegment{
@@ -230,29 +255,29 @@ func loadBackupManifest(backupDir string) (manifestInfo, error) {
 			crc:        binary.LittleEndian.Uint32(rec[16:20]),
 		}
 		if s.index != i {
-			return zero, errBadBackup
+			return zero, 0, errBadBackup
 		}
 		cumulative += uint64(s.count)
 		if s.cumulative != cumulative || s.count == 0 {
-			return zero, errBadBackup
+			return zero, 0, errBadBackup
 		}
 		info.segments = append(info.segments, s)
 	}
 	if cumulative != info.total {
-		return zero, errBadBackup
+		return zero, 0, errBadBackup
 	}
 
 	var crcb [crcSize]byte
 	if err := readFull(r, crcb[:]); err != nil {
-		return zero, err
+		return zero, 0, err
 	}
 	if binary.LittleEndian.Uint32(crcb[:]) != h.Sum32() {
-		return zero, errBadBackup
+		return zero, 0, errBadBackup
 	}
 	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
-		return zero, errBadBackup // trailing bytes, or an underlying read error
+		return zero, 0, errBadBackup // trailing bytes, or an underlying read error
 	}
-	return info, nil
+	return info, base, nil
 }
 
 // buildRestoredStore streams every named segment into a fresh wal.log in the

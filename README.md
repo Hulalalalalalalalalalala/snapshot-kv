@@ -22,7 +22,8 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Checkpoint() error` freezes complete committed state for a fast reopen.
 - `(*Store).Compact() error` reclaims overwritten and deleted history.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
-- `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup into a fresh directory and returns it open.
+- `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to a backup chain.
+- `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (or a synthesized chain) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
 
@@ -229,6 +230,50 @@ compaction is needed to use it, and the cumulative snapshot count is not reset.
 `errors.Is(err, fs.ErrClosed)`. Backup never copies the WAL or checkpoint
 layout: the artifact is a self-contained, versioned snapshot of the data, not a
 duplicate of the on-disk internals.
+
+### Incremental backup chains and synthesized restore
+
+A full export is the head of a **backup chain**:
+`BackupIncremental(chainDir)` appends one **incremental ring** to the chain in
+`chainDir`. Each ring anchors at one fixed commit watermark, exactly as `Backup`
+does, and captures only the terminal state of the keys touched between the
+previous link's export watermark and its own anchor — a put carries its value,
+a key deleted in the interval travels as a tombstone. Writes and deletes
+committed after the anchor do not enter the ring and proceed concurrently
+without blocking; reads keep hitting memory.
+
+Every ring is a self-describing, checksummed artifact in the head's own format
+— same format version, and the export-watermark and cumulative-snapshot-count
+fields carry the same meaning — stored in its own `incr-NNNNNNNNNN`
+subdirectory (numbered densely from 1) with its own segments and a manifest
+that also records the base watermark it continues from. A ring is assembled
+and fsynced in a temporary sibling directory and renamed into the chain as one
+atomic step: a process killed at any instant leaves either the old chain or
+the chain extended by one complete ring, and staging debris is swept by the
+next backup into that chain or the next open of a related directory. The store
+being backed up is never modified.
+
+`snapshot.Restore(chainDir, targetDir)` on a chain directory validates the
+whole chain — dense ring numbering, per-link manifests and file sets, and
+watermark and snapshot-count continuity — and then synthesizes the state at
+the last link's watermark by merging the links in chain order: a later link
+overrides an earlier one for the same key, and a key deleted between two
+watermarks is no longer readable. A missing ring, a broken link, a
+discontinuous watermark, a truncated ring, a checksum mismatch or an unknown
+format version rejects the entire chain with an error satisfying
+`errors.Is(err, fs.ErrInvalid)` and creates no target. Both the export and the
+synthesis stream in bounded segments — the whole keyspace is never copied into
+memory — and peak memory tracks live data and the chain length. The
+synthesized directory, once reopened, is byte-for-byte the state a full replay
+reaches at the chain's last watermark, cumulative snapshot count included.
+
+`BackupIncremental` validates the existing chain before writing anything: when
+no usable previous watermark exists (the chain head is missing or any link is
+broken) the export is rejected wholesale with an error satisfying
+`errors.Is(err, fs.ErrInvalid)` and no half-built ring is left behind. A chain
+path that does not exist or is not a directory is rejected the same way, and
+`BackupIncremental` on a closed store returns an error satisfying
+`errors.Is(err, fs.ErrClosed)`.
 
 ## Tests
 
