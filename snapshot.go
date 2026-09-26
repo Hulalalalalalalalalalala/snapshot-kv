@@ -175,6 +175,12 @@ func Open(dir string) (*Store, error) {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
+		// A chain merge or verification heal killed between its two commit
+		// renames leaves the path missing with the chain parked in a sibling.
+		// Recover it before creating the directory, otherwise MkdirAll would
+		// mask the missing chain with an empty one and strand that sibling.
+		sweepMergeDebris(dir)
+		sweepQuarantineDebris(dir)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
@@ -204,6 +210,9 @@ func Open(dir string) (*Store, error) {
 	// Sweep sibling debris a chain merge killed mid-commit can leave next to
 	// a directory that was used as a backup chain.
 	sweepMergeDebris(dir)
+	// Finish or roll back a chain verification self-heal killed mid-swap, in
+	// the same all-or-nothing manner as a merge recovery.
+	sweepQuarantineDebris(dir)
 	// Reclaim the lease of a chain operation whose holder was killed, so a
 	// related directory is never wedged behind a dead holder.
 	reclaimStaleLease(dir)

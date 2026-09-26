@@ -76,12 +76,15 @@ import (
 // anchored view shows. The sole exception is a tombstone synthesized for a
 // key the chain once held but a compaction has since forgotten entirely: its
 // delete cannot be read back from memory, so the ring records the key with
-// the anchor watermark endWM as its ordering marker. Synthesis re-sequences
-// every frame densely anyway, so the terminal state is exact regardless.
+// the anchor watermark endWM as its ordering marker. That marker may equal
+// startWM — a flat ring (endWM == startWM) holding only such anchor-stamped
+// tombstones is legal — so a delete forgotten without the tip advancing is
+// still carried on the chain. Synthesis re-sequences every frame densely
+// anyway, so the terminal state is exact regardless.
 //
 // An empty ring (no touched keys, segCount 0, endWM == startWM) is legal: it
-// still moves the chain's snapshot count forward. Any non-empty ring has
-// endWM > startWM.
+// still moves the chain's snapshot count forward. Apart from the synthesized
+// tombstones above, any non-empty ring has endWM > startWM.
 const (
 	incrStageDir    = "incr.tmp"
 	incrPrefix      = "incr-"
@@ -191,6 +194,11 @@ func scanRing(f *os.File, exp ringExpect, cb ringEntryCallback) (ringSummary, er
 	var segChain uint32
 	var lastKey string
 	haveKey := false
+	// flatRing marks a ring whose tip did not advance (endWM == startWM). Such
+	// a ring may hold only the tombstones compaction synthesized for keys the
+	// store has since forgotten entirely, each stamped at the anchor; every
+	// other entry sequence must lie strictly inside (startWM, endWM].
+	flatRing := endWM == startWM
 
 	for seg := uint32(0); seg < segCount; seg++ {
 		if err := read(shdr); err != nil {
@@ -222,7 +230,18 @@ func scanRing(f *os.File, exp ringExpect, cb ringEntryCallback) (ringSummary, er
 			if (flag != ckptFlagPut && flag != ckptFlagDelete) ||
 				keyLen == 0 || keyLen > maxRecord || valLen > maxRecord ||
 				(flag == ckptFlagDelete && valLen != 0) ||
-				seq <= startWM || seq > endWM {
+				seq > endWM {
+				return zero, errBadBackup
+			}
+			// Every ordinary entry sequence lies strictly inside
+			// (startWM, endWM]. A ring whose tip did not advance may carry
+			// only tombstones synthesized at the anchor for keys compaction
+			// has forgotten, stamped exactly at endWM == startWM.
+			if flatRing {
+				if flag != ckptFlagDelete || seq != endWM {
+					return zero, errBadBackup
+				}
+			} else if seq <= startWM {
 				return zero, errBadBackup
 			}
 			body := make([]byte, int(keyLen)+int(valLen))
@@ -277,9 +296,9 @@ func scanRing(f *os.File, exp ringExpect, cb ringEntryCallback) (ringSummary, er
 		return zero, errBadBackup
 	}
 
-	if total > 0 && endWM == startWM {
-		return zero, errBadBackup
-	}
+	// A flat ring (endWM == startWM, tip unmoved) is legal when its entries are
+	// all tombstones synthesized at the anchor for keys compaction has
+	// forgotten; that restriction is enforced entry by entry above.
 	return ringSummary{
 		index:    index,
 		endWM:    endWM,
@@ -703,6 +722,8 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	// Repair or clear debris from a merge killed mid-commit before inspecting
 	// the chain.
 	sweepMergeDebris(chainDir)
+	// Finish or roll back a verification self-heal killed mid-swap.
+	sweepQuarantineDebris(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -759,13 +780,21 @@ func (s *Store) BackupIncremental(chainDir string) error {
 		return errBadBackup
 	}
 	touched := collectTouchedKeys(anchor.view, prevPresent, startWM, anchor.watermark)
-	// Every entry must be orderable strictly inside (startWM, endWM]: a
-	// tombstone synthesized for a forgotten key is stamped at the anchor, so
-	// when the anchor did not advance past the tip this store cannot
-	// represent that delete on the chain at all. Reject the export wholesale
-	// rather than write a ring no validation would accept.
+	// Every entry must be orderable inside (startWM, endWM]. A tombstone
+	// synthesized for a key compaction has forgotten is stamped at the anchor
+	// (seq == endWM), so it stays representable even when the anchor did not
+	// advance past the tip (endWM == startWM): a flat ring of such tombstones
+	// is legal, and scanRing accepts exactly that shape. Any other entry at or
+	// before the start watermark means this store cannot extend that chain, so
+	// the export is rejected wholesale before a ring file is staged.
 	for _, e := range touched {
-		if e.seq <= startWM || e.seq > anchor.watermark {
+		if e.seq > anchor.watermark {
+			return errBadBackup
+		}
+		if e.delete && e.seq == anchor.watermark {
+			continue // synthesized tombstone stamped at the anchor
+		}
+		if e.seq <= startWM {
 			return errBadBackup
 		}
 	}

@@ -24,6 +24,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
 - `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to an existing backup chain.
 - `(*Store).MergeChain(chainDir string, rings int) error` folds the chain head and its first rings into one new full head and retires the absorbed rings.
+- `(*Store).VerifyChain(chainDir string) error` streams the chain online and isolates a damaged ring suffix, degrading the chain to its most recent intact prefix.
 - `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (a lone full artifact or a full head plus its incremental rings) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
@@ -322,17 +323,77 @@ during the merge, rejects the whole operation with an error satisfying
 `MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
+### Online verification and self-healing
+
+`VerifyChain(chainDir)` verifies the chain while it keeps serving, so
+corruption is found without waiting for a restore. Verification streams the
+artifacts **in chain order** — the head manifest and its segments, then ring
+1, ring 2, … — reading and checksumming each file in bounded passes; neither
+the whole chain nor the keyspace is read into memory or staged on disk. Each
+artifact is checked as one whole: the head product, dense ring order, the
+content-CRC link to the artifact before it, the watermark handoff, per-entry
+content checksums, the whole-file checksums and the format version.
+
+An intact chain is validated and left exactly as it was. When the head itself
+is unusable there is no good prefix to fall back to, and the call rejects the
+directory wholesale with `errors.Is(err, fs.ErrInvalid)`. When a ring — or a
+suffix beginning at one ring — is missing, truncated, checksum-bad, of an
+unknown version, unlinked or discontinuous in watermark, the chain **degrades
+to its most recent intact prefix** with ring granularity: the damaged rings
+are moved unchanged into a quarantine sibling
+(`<chain>.quar-old-*`, alongside the chain and the lease, never inside the
+validated artifact) for diagnosis, and stop taking part in restores, merges
+and later incremental exports; subsequent operations proceed normally. A ring
+past the first damaged ring is isolated together with it, since its link and
+watermark chain no longer rests on a valid predecessor.
+
+The degraded chain restores to the keys, values and cumulative snapshot count
+a full replay reaches at the last intact ring's watermark, byte-for-byte;
+batch atomicity and within-batch last-write-wins survive the degradation.
+`MergeChain` and later `BackupIncremental` calls continue from the degraded
+ring order with dense numbering, deletes covered by merged-away rings do not
+resurrect, and every appended ring keeps the whole chain validating as one
+whole.
+
+Degradation is all-or-nothing in the same shape as a merge: the intact prefix
+is copied file by file into a `<chain>.quar-new-*` sibling, validated as a
+whole, and only then committed — the old chain moves to the quarantine
+sibling and the replacement renames onto the chain path. At every instant the
+chain path holds either the old chain or one complete new chain; a kill during
+verification or the swap leaves no half chain. Reopening a related directory
+(or the next backup, incremental export, merge or restore into it) finishes an
+interrupted swap from a validated staged chain or rolls the parked old chain
+back, and clears staging debris; taking effect is itself interruptible. The
+quarantine is retained, not swept.
+
+`VerifyChain` works only on chain artifacts and never modifies the backed-up
+store: writes, batch commits, snapshot open/close, cursor paging, checkpoints,
+compactions, incremental exports and merges proceed while it runs, and reads
+keep hitting memory without waiting on the verification's disk reads. It takes
+the chain lease like every other chain operation, so an operation that cannot
+take the lease fails wholesale; a missing or non-directory chain path or an
+unusable head is rejected with `errors.Is(err, fs.ErrInvalid)`, and
+`VerifyChain` on a closed store returns an error satisfying
+`errors.Is(err, fs.ErrClosed)`. No third error class is introduced.
+
+A tombstone synthesized for a delete compaction has forgotten entirely is
+stamped at the anchor watermark and is carried on the chain even when that
+anchor does not advance the tip: a non-empty ring whose end watermark equals
+its start watermark is legal when it holds only such tombstones, so the
+forgotten delete is never mistaken for a watermark violation and never
+resurrects when the chain is synthesized to the tip.
+
 ### Chain directory coordination
 
 A chain directory can be shared by several store objects, in one process or
 across processes, so every operation that works on it — `Backup`,
-`BackupIncremental`, `MergeChain` and `Restore` — first takes the chain's
-**lease**: a small sibling file (`<chain>.lease`) naming its holder (a
-process id plus a random token) and carrying an expiry time. At most one
-registered operation holds the lease at a time, so concurrent exports,
-merges and restores on the same chain directory are mutually exclusive and
-the chain is at every instant either the old chain or the complete new one,
-never an in-between mixture.
+`BackupIncremental`, `MergeChain`, `VerifyChain` and `Restore` — first takes
+the chain's **lease**: a small sibling file (`<chain>.lease`) naming its
+holder (a process id plus a random token) and carrying an expiry time. At most
+one registered operation holds the lease at a time, so concurrent exports,
+merges, verifications and restores on the same chain directory are mutually
+exclusive and the chain is at every instant either the old chain or the
+complete new one, never an in-between mixture.
 
 The lease is never waited on: an operation that cannot take it fails
 wholesale with an error satisfying `errors.Is(err, fs.ErrInvalid)` and
