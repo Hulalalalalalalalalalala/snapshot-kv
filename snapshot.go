@@ -204,6 +204,9 @@ func Open(dir string) (*Store, error) {
 	// Sweep sibling debris a chain merge killed mid-commit can leave next to
 	// a directory that was used as a backup chain.
 	sweepMergeDebris(dir)
+	// Finish or undo a chain verification/degradation killed mid-swap, and
+	// sweep its staging and retired-chain siblings.
+	sweepVerifyDebris(dir, true)
 	// Reclaim the lease of a chain operation whose holder was killed, so a
 	// related directory is never wedged behind a dead holder.
 	reclaimStaleLease(dir)

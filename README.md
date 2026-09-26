@@ -24,6 +24,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
 - `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to an existing backup chain.
 - `(*Store).MergeChain(chainDir string, rings int) error` folds the chain head and its first rings into one new full head and retires the absorbed rings.
+- `(*Store).VerifyBackupChain(chainDir string) error` verifies the chain online and degrades it to its last intact prefix when a ring suffix is damaged.
 - `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (a lone full artifact or a full head plus its incremental rings) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
@@ -322,13 +323,80 @@ during the merge, rejects the whole operation with an error satisfying
 `MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
+### Online verification and self-healing
+
+`VerifyBackupChain(chainDir)` checks a chain online, so corruption is found
+without waiting for a restore. It streams the chain in chain order — the head
+manifest, the head segments one at a time, then the dense rings one at a time
+— and checks each link in it: the head artifact, the dense 1-based ring
+order, every ring's predecessor content-CRC link, head/ring watermark
+continuity, the per-segment and whole-file checksums and the format version.
+It reads in bounded segments and never loads the whole chain or the whole
+keyspace into memory. It takes no store lock: writes, batch commits, snapshot
+open/close, cursor paging, checkpoints, compactions, incremental exports and
+lock-free reads proceed while it runs and reads keep hitting memory instead
+of waiting on the verifier's disk reads.
+
+A healthy chain verifies and is left byte-for-byte unchanged. When a ring (or a
+suffix of rings) is damaged — missing, truncated, checksum-bad, of an unknown
+version, unlinked, with a discontinuous watermark or a regressing snapshot
+count — the chain is degraded at ring granularity to its longest intact
+prefix. The damaged suffix is moved, unchanged, into a sibling
+`<chain>.quarantine-*` directory that also carries a self-describing marker
+naming every isolated file; the isolated artifacts are kept for diagnosis and
+take no further part in restores, merges or incremental exports. The chain
+directory then holds the head plus exactly the dense intact rings, validates
+as one whole, and:
+
+- restores byte-for-byte to the state and cumulative snapshot count at the
+  last intact watermark, with batch atomicity and within-batch last-write-wins
+  preserved and deletes covered by merged rings never resurrected;
+- merges and accepts further `BackupIncremental` rings in the degraded ring
+  order (the next ring continues the dense numbering and links at the degraded
+  tip), and the appended rings still pass whole-chain verification.
+
+Damage at the head has no intact prefix in front of it, so such a chain, like
+a chain with a foreign entry or a missing/non-directory path, is rejected
+whole with an error satisfying `errors.Is(err, fs.ErrInvalid)` and is not
+moved; `Restore`, `MergeChain` and `BackupIncremental` on an un-degraded
+damaged chain keep rejecting it wholesale exactly as before. The degraded
+chain itself is the thing those operations then accept.
+
+The degradation is all-or-nothing: the replacement chain is assembled as a
+sibling directory of hard links and validated as a whole, then committed with
+the same two-rename swap a merge uses — the old chain moves to a
+`<chain>.verify-old-*` sibling and the replacement moves onto the chain path
+— so a kill at any instant leaves either the old chain or the complete new
+chain, never half a chain. The suffix is extracted into its quarantine
+directory from the retired copy only after the replacement is installed.
+Leftover staging, retired and quarantine siblings are completed or swept at
+the next verification, merge, backup or export into that directory, or the
+next open of a related directory, and reopening the directory always yields a
+complete usable chain; the quarantine and the degradation are interruptible
+too.
+
+Verification takes the chain directory's lease first, under the same
+coordination rules as every other chain operation: at most one registered
+operation advances a chain directory, a request that cannot take the lease
+fails whole with `errors.Is(err, fs.ErrInvalid)`, and a dead holder's lease is
+reclaimed and never waited on. `VerifyBackupChain` on a closed store returns
+an error satisfying `errors.Is(err, fs.ErrClosed)`. No third error type is
+introduced: every rejection uses the same `fs.ErrInvalid`/`fs.ErrClosed`
+vocabulary as the rest of the backup chain.
+
+A delete that compaction has forgotten while the chain tip did not advance is
+still recorded as a tombstone: the resulting ring has zero watermark span and
+may carry only such boundary tombstones (stamped at `startWM == endWM`). It
+passes verification and whole-chain validation, and the delete reads back as
+a miss after the chain is synthesized to the chain-tip watermark.
+
 ### Chain directory coordination
 
 A chain directory can be shared by several store objects, in one process or
 across processes, so every operation that works on it — `Backup`,
-`BackupIncremental`, `MergeChain` and `Restore` — first takes the chain's
-**lease**: a small sibling file (`<chain>.lease`) naming its holder (a
-process id plus a random token) and carrying an expiry time. At most one
+`BackupIncremental`, `MergeChain`, `VerifyBackupChain` and `Restore` — first
+takes the chain's **lease**: a small sibling file (`<chain>.lease`) naming its
+holder (a process id plus a random token) and carrying an expiry time. At most one
 registered operation holds the lease at a time, so concurrent exports,
 merges and restores on the same chain directory are mutually exclusive and
 the chain is at every instant either the old chain or the complete new one,

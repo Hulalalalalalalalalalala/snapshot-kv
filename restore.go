@@ -57,6 +57,9 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 	// the manifest and the segments it names. A merge killed mid-commit next
 	// to the chain is repaired or swept first.
 	sweepMergeDebris(backupDir)
+	// A verification/degradation killed mid-swap is finished or undone before
+	// the artifact is inspected.
+	sweepVerifyDebris(backupDir, false)
 	binfo, err := os.Stat(backupDir)
 	if err != nil {
 		return nil, errBadBackup

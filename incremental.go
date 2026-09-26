@@ -72,16 +72,21 @@ import (
 //	fileCRC     uint32   IEEE CRC-32 of every preceding byte of the file
 //
 // Entries are strictly key-ascending and unique inside one ring. Every entry
-// sequence lies in (startWM, endWM]: it is the terminal commit sequence the
-// anchored view shows. The sole exception is a tombstone synthesized for a
-// key the chain once held but a compaction has since forgotten entirely: its
-// delete cannot be read back from memory, so the ring records the key with
-// the anchor watermark endWM as its ordering marker. Synthesis re-sequences
-// every frame densely anyway, so the terminal state is exact regardless.
+// sequence normally lies in (startWM, endWM]: it is the terminal commit
+// sequence the anchored view shows. The sole exception is a tombstone
+// synthesized for a key the chain once held but a compaction has since
+// forgotten entirely: its delete cannot be read back from memory, so the ring
+// records the key with the anchor watermark endWM as its ordering marker.
+// That marker equals startWM exactly when the chain tip did not advance
+// (startWM == endWM); such a zero-span ring may hold only these boundary
+// tombstones. Synthesis re-sequences every frame densely anyway, so the
+// terminal state is exact regardless.
 //
 // An empty ring (no touched keys, segCount 0, endWM == startWM) is legal: it
-// still moves the chain's snapshot count forward. Any non-empty ring has
-// endWM > startWM.
+// still moves the chain's snapshot count forward. Any non-empty ring normally
+// has endWM > startWM; the one other legal zero-span ring holds only the
+// boundary synthetic tombstones described below (a delete compaction forgot
+// while the chain tip did not advance), each stamped at startWM == endWM.
 const (
 	incrStageDir    = "incr.tmp"
 	incrPrefix      = "incr-"
@@ -222,7 +227,16 @@ func scanRing(f *os.File, exp ringExpect, cb ringEntryCallback) (ringSummary, er
 			if (flag != ckptFlagPut && flag != ckptFlagDelete) ||
 				keyLen == 0 || keyLen > maxRecord || valLen > maxRecord ||
 				(flag == ckptFlagDelete && valLen != 0) ||
-				seq <= startWM || seq > endWM {
+				seq > endWM || seq < startWM {
+				return zero, errBadBackup
+			}
+			// Entry sequences lie strictly inside (startWM, endWM]. The sole
+			// boundary exception is a synthetic tombstone for a key the chain
+			// once held but compaction has since forgotten: it is stamped at
+			// the anchor watermark, which may equal startWM when the chain tip
+			// did not advance. Such a ring carries only these boundary
+			// tombstones; a put (or any other entry) at the boundary is invalid.
+			if seq == startWM && !(flag == ckptFlagDelete && startWM == endWM) {
 				return zero, errBadBackup
 			}
 			body := make([]byte, int(keyLen)+int(valLen))
@@ -277,9 +291,9 @@ func scanRing(f *os.File, exp ringExpect, cb ringEntryCallback) (ringSummary, er
 		return zero, errBadBackup
 	}
 
-	if total > 0 && endWM == startWM {
-		return zero, errBadBackup
-	}
+	// A zero-span ring (endWM == startWM) is legal only when every entry is a
+	// boundary synthetic tombstone; the per-entry check above rejects every
+	// other entry in that case, so total > 0 here means exactly that shape.
 	return ringSummary{
 		index:    index,
 		endWM:    endWM,
@@ -703,6 +717,7 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	// Repair or clear debris from a merge killed mid-commit before inspecting
 	// the chain.
 	sweepMergeDebris(chainDir)
+	sweepVerifyDebris(chainDir, false)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -759,13 +774,17 @@ func (s *Store) BackupIncremental(chainDir string) error {
 		return errBadBackup
 	}
 	touched := collectTouchedKeys(anchor.view, prevPresent, startWM, anchor.watermark)
-	// Every entry must be orderable strictly inside (startWM, endWM]: a
-	// tombstone synthesized for a forgotten key is stamped at the anchor, so
-	// when the anchor did not advance past the tip this store cannot
-	// represent that delete on the chain at all. Reject the export wholesale
-	// rather than write a ring no validation would accept.
+	// Every entry must be orderable inside [startWM, endWM]. The one boundary
+	// case is a tombstone synthesized for a key compaction has forgotten: it is
+	// stamped at the anchor watermark, which equals startWM when the chain tip
+	// did not advance. Such a boundary entry is a delete in a zero-span ring
+	// and is the only thing that may sit at startWM; a put there is rejected
+	// wholesale rather than written as a ring no validation would accept.
 	for _, e := range touched {
-		if e.seq <= startWM || e.seq > anchor.watermark {
+		if e.seq < startWM || e.seq > anchor.watermark {
+			return errBadBackup
+		}
+		if e.seq == startWM && !(e.delete && startWM == anchor.watermark) {
 			return errBadBackup
 		}
 	}
