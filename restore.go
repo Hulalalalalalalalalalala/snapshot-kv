@@ -32,10 +32,26 @@ import (
 // A backup path that does not exist or is not a directory is rejected with an
 // error wrapping fs.ErrInvalid. A target path that already exists and is not
 // empty (including a regular file) is rejected the same way.
+//
+// The restore takes the chain directory's lease before touching anything, so
+// concurrent exports, merges and restores on the same chain directory are
+// mutually exclusive: a restore that cannot take the lease fails wholesale
+// with an error wrapping fs.ErrInvalid and creates no target, and a lease
+// left behind by a killed holder is reclaimed, never waited on.
 func Restore(backupDir, targetDir string) (*Store, error) {
 	if backupDir == "" || targetDir == "" {
 		return nil, errBadBackup
 	}
+
+	// Coordinate with every other operation on this chain directory, in this
+	// process or another: only the lease holder may repair debris and stream
+	// the chain. A live holder fails the whole restore; a killed holder's
+	// lease is reclaimed.
+	lease, err := acquireChainLease(backupDir)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.release()
 
 	// The artifact itself must be an existing directory whose only entries are
 	// the manifest and the segments it names. A merge killed mid-commit next
