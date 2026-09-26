@@ -322,6 +322,45 @@ during the merge, rejects the whole operation with an error satisfying
 `MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
+### Cross-storage coordination and lease recovery
+
+The chain directory is shared: more than one store (even in separate
+processes) can be asked to run a full export, an incremental append, a merge
+or a restore against the same path. Advancement is therefore coordinated by
+one self-describing lease record. The authoritative lease is a single file in
+the chain directory's parent, named `<chain>.chain-lease`; a descriptive
+mirror (`lease.dat`) is also carried inside the chain directory. Every
+record is checksummed and names its holder — operation kind, process id,
+host, issue time, a random nonce — and an absolute expiry time.
+
+Exactly one holder exists at a time: the lease is claimed with a
+never-overwriting hard link, so concurrent contenders cannot both win. The
+holder alone advances the chain; a contender that finds a live, unexpired
+lease fails the whole operation with `errors.Is(err, fs.ErrInvalid)` and
+changes nothing. A holder renews its lease while it streams, so long exports
+and merges keep the lock without holding the keyspace; writes, deletes,
+batches, snapshot open/close, cursor paging, checkpoints, compaction and
+lock-free reads proceed as before and are never blocked by coordination. At
+every commit point the holder re-checks that it still owns the lease, so a
+ring appended and a new merged head can never overwrite or lose one another.
+
+The lease is crash-safe. If a holder is killed mid-run it simply stops
+renewing; once its expiry passes, the next full export, incremental export,
+merge, restore or open of a related directory recognizes the stale record,
+reclaims it and takes over. The chain underneath is always one complete old
+chain or one complete new chain, so recovery needs no manual cleanup and can
+never deadlock. Taking over before the expiry fails with `fs.ErrInvalid` and
+leaves the chain untouched; a truncated or corrupt lease file is treated as
+dead debris rather than a live holder. Recovery of a merge killed between its
+two swap renames moves the whole parked old chain back into place (or leaves
+the complete new chain in place) and never deletes it; coordination and
+staging files are never mistaken for artifact files, while a chain directory
+that does not exist, is not a directory, has no usable head, or whose rings
+are gapped, broken, discontinuous in watermark, truncated, checksum-bad or of
+an unknown version is rejected wholesale with `fs.ErrInvalid` and left as it
+was. Every chain operation on a closed store satisfies
+`errors.Is(err, fs.ErrClosed)`; coordination introduces no other error type.
+
 ## Tests
 
     go test ./...

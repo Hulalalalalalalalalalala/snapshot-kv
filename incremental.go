@@ -428,6 +428,8 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 			sawManifest = true
 		case name == backupManifestTmp:
 			return zero, errBadBackup
+		case isLeaseCoordinationName(name):
+			// live coordination metadata; never part of the artifact set
 		default:
 			if idx, ok := parseSegmentIndex(name); ok {
 				if !headSegs[idx] {
@@ -683,9 +685,10 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	if chainDir == "" {
 		return errBadBackup
 	}
-	// Repair or clear debris from a merge killed mid-commit before inspecting
-	// the chain.
-	sweepMergeDebris(chainDir)
+	// Repair or clear debris from a merge killed mid-commit before anything
+	// else (a kill between the swap renames leaves the old chain in a trash
+	// sibling and this moves it back), but never under a live merge lease.
+	recoverChainCoordination(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -696,6 +699,19 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	if !info.IsDir() {
 		return errBadBackup
 	}
+	// Take the cross-storage chain lease before touching the chain. A live
+	// lease held by another full export, incremental export, merge or restore
+	// fails the whole append with fs.ErrInvalid and leaves the chain exactly as
+	// it was; an expired or corrupt lease (a holder killed mid-run) is
+	// reclaimed first.
+	lease, lerr := acquireLease(chainDir, leaseKindIncremental)
+	if lerr != nil {
+		return lerr
+	}
+	defer lease.release()
+	// Clear merge leftovers a prior killed holder left (preserving nothing of
+	// a dead merge lease; this holder owns the inside lease).
+	recoverChainCoordinationOwned(chainDir)
 	// Clear staging debris from an export (full or incremental) killed mid-run
 	// before inspecting the chain; a manifest temp is pure debris as well.
 	for _, stage := range []string{incrStageDir, backupStageDir} {
@@ -750,7 +766,7 @@ func (s *Store) BackupIncremental(chainDir string) error {
 		startWM:  startWM,
 		endWM:    anchor.watermark,
 		snaps:    anchor.snaps,
-	}, anchor, touched)
+	}, anchor, touched, lease)
 }
 
 // ringHeader carries the fixed fields of a ring being written.
@@ -798,7 +814,7 @@ func collectTouchedKeys(v *view, prevPresent map[string]struct{}, startWM, endWM
 // the staging directory and links it into place atomically (link fails
 // rather than overwrite when another export advanced the chain). The chain
 // directory is forced afterwards.
-func writeIncrementalRing(chainDir string, hdr ringHeader, anchor backupAnchor, touched []ringEntryKind) error {
+func writeIncrementalRing(chainDir string, hdr ringHeader, anchor backupAnchor, touched []ringEntryKind, lease *leaseToken) error {
 	final := ringName(hdr.index)
 
 	// Refuse to build before staging anything if another ring of this index
@@ -975,6 +991,13 @@ func writeIncrementalRing(chainDir string, hdr ringHeader, anchor backupAnchor, 
 		return err
 	}
 
+	// Fence before the chain mutation: if the lease aged out and was taken
+	// over while the ring streamed, this export must not link onto a chain it
+	// no longer owns. The staged file is discarded; the chain stays whole.
+	if !lease.stillOurs() {
+		cleanup()
+		return errLeaseBusy
+	}
 	// Promote with link(2): it never overwrites, so a concurrent export cannot
 	// be clobbered, and the ring appears whole or not at all.
 	if err := os.Link(tmpPath, filepath.Join(chainDir, final)); err != nil {

@@ -37,10 +37,14 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 		return nil, errBadBackup
 	}
 
+	// Repair merge debris from a killed prior commit first (a kill between the
+	// swap renames leaves the chain name missing and the whole old chain in a
+	// trash sibling, which this moves back), but never under a live merge
+	// lease another process holds.
+	recoverChainCoordination(backupDir)
+
 	// The artifact itself must be an existing directory whose only entries are
-	// the manifest and the segments it names. A merge killed mid-commit next
-	// to the chain is repaired or swept first.
-	sweepMergeDebris(backupDir)
+	// the manifest and the segments it names.
 	binfo, err := os.Stat(backupDir)
 	if err != nil {
 		return nil, errBadBackup
@@ -48,6 +52,21 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 	if !binfo.IsDir() {
 		return nil, errBadBackup
 	}
+
+	// Restore advances no chain, but it reads the directory as one whole while
+	// an exporter or merge could be reshaping it: it shares the same exclusive
+	// coordination so it never observes a half-swapped chain. A live lease
+	// rejects the restore with fs.ErrInvalid and leaves the directory
+	// untouched; an expired or corrupt lease (a holder killed mid-run) is
+	// reclaimed first. The artifact is never modified.
+	lease, lerr := acquireLease(backupDir, leaseKindRestore)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer lease.release()
+	// Clear merge leftovers a prior killed holder left; the inside lease this
+	// restore holds is preserved and a dead merge sibling lease reaped.
+	recoverChainCoordinationOwned(backupDir)
 
 	// When incremental rings extend the head artifact, the whole chain is
 	// validated up front (missing rings, broken links, discontinuous
@@ -167,6 +186,9 @@ func verifyBackupFileSet(backupDir string, segs []manifestSegment) error {
 				return errBadBackup // an unfinished manifest means an unfinished export
 			}
 			continue
+		}
+		if isLeaseCoordinationName(name) {
+			continue // live coordination metadata; not an artifact file
 		}
 		idx, ok := parseSegmentIndex(name)
 		if !ok {

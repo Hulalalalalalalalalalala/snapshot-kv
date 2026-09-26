@@ -134,11 +134,12 @@ func (s *Store) Backup(outDir string) error {
 		return errBadBackup
 	}
 
-	// Prepare the output directory and clear debris from an export killed
-	// mid-run, before touching the store. A finished artifact or any foreign
-	// entry is never overwritten. Debris from a chain merge killed mid-commit
-	// next to this directory is repaired or swept first.
-	sweepMergeDebris(outDir)
+	// Repair merge debris from a killed prior commit first (a kill between the
+	// swap renames leaves the chain name missing and the whole old chain in a
+	// trash sibling, which this moves back), but never under a live merge
+	// lease another process holds.
+	recoverChainCoordination(outDir)
+
 	info, err := os.Stat(outDir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -150,6 +151,20 @@ func (s *Store) Backup(outDir string) error {
 	} else if !info.IsDir() {
 		return errBadBackup
 	}
+
+	// Take the cross-storage chain lease before clearing debris or writing
+	// anything: a full export is exclusive with concurrent incremental
+	// exports, merges and restores against the same directory. A live lease
+	// fails the whole export with fs.ErrInvalid; an expired or corrupt lease
+	// (a holder killed mid-run) is reclaimed first.
+	lease, lerr := acquireLease(outDir, leaseKindFull)
+	if lerr != nil {
+		return lerr
+	}
+	defer lease.release()
+	// Clear merge leftovers a prior killed holder left; the inside lease this
+	// export holds is preserved and a dead merge sibling lease reaped.
+	recoverChainCoordinationOwned(outDir)
 	if err := prepareBackupDir(outDir); err != nil {
 		return err
 	}
@@ -168,7 +183,7 @@ func (s *Store) Backup(outDir string) error {
 	}
 	s.mu.Unlock()
 
-	return writeBackup(outDir, anchor)
+	return writeBackup(outDir, anchor, lease)
 }
 
 // prepareBackupDir makes outDir an empty target for a fresh artifact: it
@@ -184,6 +199,10 @@ func prepareBackupDir(outDir string) error {
 		switch {
 		case e.IsDir() && (name == backupStageDir || name == incrStageDir):
 			// staging debris, removed below
+		case !e.IsDir() && name == leaseFileName:
+			// the live in-directory lease mirror this holder carries
+		case !e.IsDir() && isLeaseCoordinationName(name):
+			// a killed contender's claim or mirror temp, removed below
 		case !e.IsDir() && (isBackupSegmentName(name) || isBackupRingName(name) || name == backupManifestTmp):
 			// orphaned by a kill, removed below
 		default:
@@ -200,7 +219,9 @@ func prepareBackupDir(outDir string) error {
 			continue
 		}
 		name := e.Name()
-		if isBackupSegmentName(name) || isBackupRingName(name) || name == backupManifestTmp {
+		debris := (isLeaseCoordinationName(name) && name != leaseFileName) ||
+			isBackupSegmentName(name) || isBackupRingName(name) || name == backupManifestTmp
+		if debris {
 			if err := os.Remove(filepath.Join(outDir, name)); err != nil &&
 				!errors.Is(err, os.ErrNotExist) {
 				return err
@@ -258,7 +279,7 @@ func segmentName(index uint32) string {
 
 // writeBackup streams the anchor's terminal entries into segments and finishes
 // with the manifest. It holds no store lock: the anchored view is immutable.
-func writeBackup(outDir string, anchor backupAnchor) error {
+func writeBackup(outDir string, anchor backupAnchor, lease *leaseToken) error {
 	stage := filepath.Join(outDir, backupStageDir)
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return err
@@ -320,6 +341,12 @@ func writeBackup(outDir string, anchor backupAnchor) error {
 			cleanup()
 			return err
 		}
+		// Fence: a lease taken over while the export streams means this export
+		// no longer owns the directory; stop promoting and discard the stage.
+		if !lease.stillOurs() {
+			cleanup()
+			return errLeaseBusy
+		}
 		// Promote the fully synced segment out of staging. A crash exposes at
 		// worst a finished segment without the manifest, which is pure debris;
 		// it never exposes a partial file under a finished name.
@@ -346,7 +373,13 @@ func writeBackup(outDir string, anchor backupAnchor) error {
 
 	// The manifest is the commit point: it names exactly the durable segment
 	// set and carries the artifact metadata. Building it last makes the whole
-	// export all-or-nothing.
+	// export all-or-nothing. Re-fence first so an export whose lease was taken
+	// over (including an empty keyspace with no segment fence above) never
+	// installs the manifest onto a directory it no longer owns.
+	if !lease.stillOurs() {
+		cleanup()
+		return errLeaseBusy
+	}
 	if err := writeManifest(outDir, stage, anchor, total, segments); err != nil {
 		cleanup()
 		return err

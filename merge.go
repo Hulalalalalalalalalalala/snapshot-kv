@@ -95,9 +95,12 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 	if chainDir == "" || rings < 1 {
 		return errBadBackup
 	}
-	// Repair or clear debris from a merge killed mid-commit before inspecting
-	// the chain, exactly as the next backup or open of the directory would.
-	sweepMergeDebris(chainDir)
+	// Repair or clear debris from a merge killed mid-commit before anything
+	// else: a kill between the two commit renames leaves the chain name
+	// missing and the whole old chain in a trash sibling, which this moves
+	// back. A live merge lease belongs to another in-progress merge and makes
+	// this recovery a no-op.
+	recoverChainCoordination(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -108,6 +111,20 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 	if !info.IsDir() {
 		return errBadBackup
 	}
+	// Take the cross-storage chain lease before touching the chain. A live
+	// lease held by another backup, incremental export, merge or restore fails
+	// the whole merge with fs.ErrInvalid and leaves the chain untouched; a
+	// lease whose holder was killed (expired or corrupt) is reclaimed first.
+	// The authoritative lease is a stable sibling of the chain directory, so it
+	// stays live and identifiable across the directory swap below.
+	lease, lerr := acquireLease(chainDir, leaseKindMerge)
+	if lerr != nil {
+		return lerr
+	}
+	defer lease.release()
+	// With the lease in hand, clear any staging/trash a prior killed merge
+	// left; this holder's own authoritative lease and mirror are preserved.
+	recoverChainCoordinationOwned(chainDir)
 	// Clear staging debris from an export (full or incremental) killed
 	// mid-run; a manifest temp is pure debris as well.
 	for _, stage := range []string{incrStageDir, backupStageDir} {
@@ -208,6 +225,21 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 		again.tipCRC != art.tipCRC || again.endWM != art.endWM ||
 		again.snaps != art.snaps {
 		return errBadBackup
+	}
+	// Fence: a lease that has aged out and been taken over by another holder
+	// means this merge lost the right to reshape the chain. This is checked
+	// before any stateful rename, so aborting leaves the chain exactly as it
+	// was.
+	if !lease.stillOurs() {
+		return errLeaseBusy
+	}
+
+	// Copy a freshly renewed, self-describing lease mirror into the staged new
+	// chain so the directory that lands at the chain path after the swap
+	// carries the current holder record. The authoritative lease stays at its
+	// stable sibling path throughout the swap.
+	if err := writeInsideMirror(stage, lease.freshen()); err != nil {
+		return err
 	}
 
 	// Commit: move the old chain aside, move the staged chain onto the chain
@@ -601,59 +633,6 @@ func writeMergedRing(path string, hdr ringHeader, segCount uint32, total uint64,
 		return 0, err
 	}
 	return binary.LittleEndian.Uint32(fc[:]), nil
-}
-
-// sweepMergeDebris clears the sibling directories a merge can leave next to
-// chainDir when it is killed: a staging chain ("<base>.merge-new-*") and a
-// retired old chain ("<base>.merge-old-*"). If the chain path itself is
-// missing but a retired old chain exists, the merge was killed between the
-// two commit renames and the whole old chain is moved back into place first.
-// It is best-effort: leftover debris never affects the chain at chainDir.
-func sweepMergeDebris(chainDir string) {
-	parent := filepath.Dir(chainDir)
-	base := filepath.Base(chainDir)
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		return
-	}
-	var staging, trash []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if isMergeTempName(name, base, mergeStagePrefix) {
-			staging = append(staging, name)
-		}
-		if isMergeTempName(name, base, mergeTrashPrefix) {
-			trash = append(trash, name)
-		}
-	}
-	if len(staging) == 0 && len(trash) == 0 {
-		return
-	}
-	changed := false
-	if _, err := os.Stat(chainDir); errors.Is(err, os.ErrNotExist) && len(trash) > 0 {
-		// Killed between the two commit renames: the old chain is whole in
-		// the trash sibling; put it back before clearing anything.
-		if err := os.Rename(filepath.Join(parent, trash[0]), chainDir); err == nil {
-			changed = true
-			trash = trash[1:]
-		}
-	}
-	for _, name := range staging {
-		if err := os.RemoveAll(filepath.Join(parent, name)); err == nil {
-			changed = true
-		}
-	}
-	for _, name := range trash {
-		if err := os.RemoveAll(filepath.Join(parent, name)); err == nil {
-			changed = true
-		}
-	}
-	if changed {
-		_ = syncDirectory(parent)
-	}
 }
 
 // isMergeTempName reports whether name is a merge staging or trash directory
