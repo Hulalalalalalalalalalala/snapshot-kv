@@ -42,10 +42,12 @@ import (
 //
 // MergeChain never touches the backed-up store: it reads only chain
 // artifacts, so writes, batch commits, snapshot open/close, cursor paging,
-// checkpoints, compactions and lock-free reads proceed while it runs. It is
-// serialized with incremental exports on the same store (and re-validates the
-// chain tip before committing, so a chain advanced concurrently by another
-// exporter rejects the merge wholesale rather than being clobbered by it).
+// checkpoints, compactions and lock-free reads proceed while it runs. It holds
+// the chain directory's coordination lease for the whole operation (mutually
+// exclusive with every other full export, incremental export, merge and
+// restore on that chain) and re-validates the chain tip before committing, so
+// a chain advanced concurrently by another exporter rejects the merge
+// wholesale rather than being clobbered by it.
 const (
 	mergeStagePrefix = ".merge-new-"
 	mergeTrashPrefix = ".merge-old-"
@@ -83,30 +85,22 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 	if s.closed.Load() {
 		return errStoreClosed
 	}
-	// Serialize with incremental exports driven by this store so a merge and
-	// an export never race to reshape the same chain. This lock is
-	// independent of mu: it is held across the merge's disk I/O and never
-	// blocks commits or lock-free reads.
-	s.backupMu.Lock()
-	defer s.backupMu.Unlock()
-	if s.closed.Load() {
-		return errStoreClosed
-	}
 	if chainDir == "" || rings < 1 {
 		return errBadBackup
 	}
-	// Repair or clear debris from a merge killed mid-commit before inspecting
-	// the chain, exactly as the next backup or open of the directory would.
-	sweepMergeDebris(chainDir)
-	info, err := os.Stat(chainDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return errBadBackup
-		}
-		return err
+	// Register the merge on the chain directory for its whole duration.
+	// Reconciliation of a merge killed mid-commit happens as part of taking
+	// the lease, so a concurrent full export, incremental export, merge or
+	// restore on the same chain fails wholesale with fs.ErrInvalid. The
+	// lease is independent of s.mu: it spans the merge's disk I/O and never
+	// blocks commits or lock-free reads.
+	lease, lerr := coordinateChain(chainDir, chainOpMerge, false)
+	if lerr != nil {
+		return lerr
 	}
-	if !info.IsDir() {
-		return errBadBackup
+	defer lease.release()
+	if s.closed.Load() {
+		return errStoreClosed
 	}
 	// Clear staging debris from an export (full or incremental) killed
 	// mid-run; a manifest temp is pure debris as well.
@@ -144,6 +138,12 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 			os.RemoveAll(stage)
 		}
 	}()
+	// Register the staging sibling for the whole merge, not just at commit,
+	// so another process's open/sweep of a related directory can never remove
+	// the half-streamed new chain while this merge is still building it.
+	if err := lease.prepareSwap(stage); err != nil {
+		return err
+	}
 
 	// The new head covers the chain through ring n: its export watermark and
 	// cumulative snapshot count are exactly that ring's.
@@ -210,6 +210,9 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 		return errBadBackup
 	}
 
+	// The staged sibling has been lease-protected since the merge started
+	// streaming; the chain therefore stays registered across both renames.
+
 	// Commit: move the old chain aside, move the staged chain onto the chain
 	// path, then delete the old chain. A kill before the first rename leaves
 	// the old chain; a kill between the renames leaves the whole old chain in
@@ -217,12 +220,15 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 	// second rename leaves the complete new chain.
 	trash, err := os.MkdirTemp(parent, base+mergeTrashPrefix)
 	if err != nil {
+		lease.abortSwap()
 		return err
 	}
 	if err := os.Remove(trash); err != nil {
+		lease.abortSwap()
 		return err
 	}
 	if err := os.Rename(chainDir, trash); err != nil {
+		lease.abortSwap()
 		return err
 	}
 	if err := os.Rename(stage, chainDir); err != nil {
@@ -230,9 +236,13 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 		if rb := os.Rename(trash, chainDir); rb == nil {
 			_ = syncDirectory(parent)
 		}
+		lease.abortSwap()
 		return err
 	}
 	committed = true
+	// The staged lock descriptor now sits at the chain path; the original
+	// descriptor moved with the old chain into the trash sibling.
+	lease.committedSwap(chainDir)
 	if err := syncDirectory(parent); err != nil {
 		return err
 	}
@@ -632,10 +642,35 @@ func sweepMergeDebris(chainDir string) {
 	if len(staging) == 0 && len(trash) == 0 {
 		return
 	}
+	// A sibling still carrying a live chain lease is the in-flight merge of a
+	// running process (the window between its two commit renames). Touch
+	// nothing: its trash must not be moved back or deleted by an observer, and
+	// its staged chain is about to land on chainDir itself.
+	for _, name := range append(append([]string{}, staging...), trash...) {
+		if dirHasLiveLease(filepath.Join(parent, name)) {
+			return
+		}
+	}
 	changed := false
-	if _, err := os.Stat(chainDir); errors.Is(err, os.ErrNotExist) && len(trash) > 0 {
+	moveBack := false
+	if ci, err := os.Stat(chainDir); errors.Is(err, os.ErrNotExist) {
+		moveBack = len(trash) > 0
+	} else if err == nil && ci.IsDir() {
+		// Open may have (re)created an empty chain directory after the kill;
+		// the whole old chain waiting in the trash still belongs at the path.
+		entries, _ := os.ReadDir(chainDir)
+		moveBack = len(entries) == 0 && len(trash) > 0
+	}
+	if moveBack {
 		// Killed between the two commit renames: the old chain is whole in
-		// the trash sibling; put it back before clearing anything.
+		// the trash sibling; put it back before clearing anything. Rename
+		// cannot replace even an empty directory on Linux, so remove the
+		// empty placeholder Open may have created first.
+		if ci, err := os.Stat(chainDir); err == nil && ci.IsDir() {
+			if rerr := os.Remove(chainDir); rerr != nil {
+				return
+			}
+		}
 		if err := os.Rename(filepath.Join(parent, trash[0]), chainDir); err == nil {
 			changed = true
 			trash = trash[1:]

@@ -134,22 +134,17 @@ func (s *Store) Backup(outDir string) error {
 		return errBadBackup
 	}
 
-	// Prepare the output directory and clear debris from an export killed
-	// mid-run, before touching the store. A finished artifact or any foreign
-	// entry is never overwritten. Debris from a chain merge killed mid-commit
-	// next to this directory is repaired or swept first.
-	sweepMergeDebris(outDir)
-	info, err := os.Stat(outDir)
+	// Reconcile a merge killed mid-commit next to this directory, create the
+	// output directory if needed, and take the chain directory lease for the
+	// whole export: a concurrent incremental export, merge or restore on this
+	// same directory fails wholesale with fs.ErrInvalid rather than observing
+	// a half-written artifact. The lease is released (and its lock file
+	// removed) on every return path.
+	lease, err := coordinateChain(outDir, chainOpBackup, true)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		if err := os.MkdirAll(outDir, 0o700); err != nil {
-			return err
-		}
-	} else if !info.IsDir() {
-		return errBadBackup
+		return err
 	}
+	defer lease.release()
 	if err := prepareBackupDir(outDir); err != nil {
 		return err
 	}
@@ -184,8 +179,9 @@ func prepareBackupDir(outDir string) error {
 		switch {
 		case e.IsDir() && (name == backupStageDir || name == incrStageDir):
 			// staging debris, removed below
-		case !e.IsDir() && (isBackupSegmentName(name) || isBackupRingName(name) || name == backupManifestTmp):
-			// orphaned by a kill, removed below
+		case !e.IsDir() && (isBackupSegmentName(name) || isBackupRingName(name) ||
+			name == backupManifestTmp || name == chainLockName):
+			// orphaned by a kill (or the live chain lease), removed below
 		default:
 			return errBadBackup
 		}

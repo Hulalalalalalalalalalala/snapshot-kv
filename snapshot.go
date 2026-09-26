@@ -139,12 +139,6 @@ type Store struct {
 	queue     []*pendingBatch
 	committer bool
 
-	// backupMu serializes exports that stage into one chain directory
-	// (BackupIncremental) so two exports on this store never share their
-	// staging directory. It is independent of mu: it is held across the
-	// export's disk I/O and never blocks commits or lock-free reads.
-	backupMu sync.Mutex
-
 	// Test hook, nil outside tests. leaderHook runs once after a commit has
 	// become leader, before its first queue drain, and lets tests hold a
 	// leader until a known number of commits have coalesced.
@@ -204,6 +198,9 @@ func Open(dir string) (*Store, error) {
 	// Sweep sibling debris a chain merge killed mid-commit can leave next to
 	// a directory that was used as a backup chain.
 	sweepMergeDebris(dir)
+	// Reclaim a chain lease a process killed mid-operation left behind, so
+	// the next use of the chain needs no manual cleanup.
+	reclaimChainLease(dir)
 
 	latest := newView(nil)
 	var replaySeq uint64

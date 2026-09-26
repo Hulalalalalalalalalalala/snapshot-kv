@@ -322,6 +322,39 @@ during the merge, rejects the whole operation with an error satisfying
 `MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
+### Chain coordination and lease reclamation
+
+All four operations that work on one chain directory — a full `Backup`
+exporting into it, `BackupIncremental`, `MergeChain` and `Restore` reading it
+for synthesis — are mutually exclusive across storage objects and processes.
+At any instant the chain is either exactly the chain before the registered
+operation or the complete chain after it; an intermediate state is never
+observable. Coordination is a `chain.lock` file inside the chain directory:
+its holder keeps a non-blocking whole-file write lock (a Linux
+open-file-description lock) for the duration of the operation, and the file
+body names the holder, the operation and a deadline that the holder renews in
+the background while it streams.
+
+Acquisition never waits: a request that finds a live holder fails wholesale,
+before it inspects the chain, with an error satisfying
+`errors.Is(err, fs.ErrInvalid)`; the chain is untouched and the caller may
+retry. Coordination spans the operation's disk I/O only — it is independent of
+the store write lock, so commits, batch syncs, snapshot open/close, cursor
+paging, checkpoints, compactions and lock-free reads proceed while an export
+or merge runs. A merge holds the chain through its directory swap as well, and
+re-confirms the chain tip just before committing: a chain advanced by someone
+else rejects the merge and leaves the chain as it was.
+
+A holder killed mid-operation releases its write lock as its descriptors
+close; on filesystems that retain the lock, the deadline expiring marks the
+holder dead. Either way the stale `chain.lock` is reclaimed automatically — at
+the next backup, incremental export, merge or restore into that directory, and
+at the next open of the directory or a related sibling — after which the chain
+is usable again with no manual cleanup. When a merge is killed in the window
+between its two commit renames (chain path missing, old chain parked whole in a
+trash sibling), reclamation moves the parked old chain back into place; it is
+never deleted.
+
 ## Tests
 
     go test ./...

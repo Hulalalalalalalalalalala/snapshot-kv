@@ -428,6 +428,9 @@ func validateBackupChain(backupDir string) (artifactInfo, error) {
 			sawManifest = true
 		case name == backupManifestTmp:
 			return zero, errBadBackup
+		case name == chainLockName:
+			// coordination bookkeeping, never chain data
+			continue
 		default:
 			if idx, ok := parseSegmentIndex(name); ok {
 				if !headSegs[idx] {
@@ -672,29 +675,23 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	if s.closed.Load() {
 		return errStoreClosed
 	}
-	// Serialize exports driven by one store so they can never share a staging
-	// directory or race to append the same ring index. This does not serialize
-	// with commits or reads.
-	s.backupMu.Lock()
-	defer s.backupMu.Unlock()
-	if s.closed.Load() {
-		return errStoreClosed
-	}
 	if chainDir == "" {
 		return errBadBackup
 	}
-	// Repair or clear debris from a merge killed mid-commit before inspecting
-	// the chain.
-	sweepMergeDebris(chainDir)
-	info, err := os.Stat(chainDir)
+	// Register this export on the chain directory. Reconciliation of a merge
+	// killed mid-commit happens as part of taking the lease, so a concurrent
+	// full export, incremental export, merge or restore on the same chain
+	// fails wholesale with fs.ErrInvalid rather than sharing the staging
+	// directory or racing the next ring index. The lease is independent of
+	// s.mu: it spans the export's disk I/O and never blocks commits or
+	// lock-free reads.
+	lease, err := coordinateChain(chainDir, chainOpIncremental, false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return errBadBackup
-		}
 		return err
 	}
-	if !info.IsDir() {
-		return errBadBackup
+	defer lease.release()
+	if s.closed.Load() {
+		return errStoreClosed
 	}
 	// Clear staging debris from an export (full or incremental) killed mid-run
 	// before inspecting the chain; a manifest temp is pure debris as well.

@@ -39,8 +39,7 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 
 	// The artifact itself must be an existing directory whose only entries are
 	// the manifest and the segments it names. A merge killed mid-commit next
-	// to the chain is repaired or swept first.
-	sweepMergeDebris(backupDir)
+	// to the chain is repaired or swept as part of taking the chain lease.
 	binfo, err := os.Stat(backupDir)
 	if err != nil {
 		return nil, errBadBackup
@@ -48,6 +47,15 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 	if !binfo.IsDir() {
 		return nil, errBadBackup
 	}
+	// A restore synthesizes the chain exclusively: a concurrent full export,
+	// incremental export or merge in this directory fails wholesale rather
+	// than racing the files the restore reads, and a second restore fails
+	// rather than joining it.
+	lease, lerr := coordinateChain(backupDir, chainOpRestore, false)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer lease.release()
 
 	// When incremental rings extend the head artifact, the whole chain is
 	// validated up front (missing rings, broken links, discontinuous
@@ -167,6 +175,9 @@ func verifyBackupFileSet(backupDir string, segs []manifestSegment) error {
 				return errBadBackup // an unfinished manifest means an unfinished export
 			}
 			continue
+		}
+		if name == chainLockName {
+			continue // coordination bookkeeping, never chain data
 		}
 		idx, ok := parseSegmentIndex(name)
 		if !ok {
