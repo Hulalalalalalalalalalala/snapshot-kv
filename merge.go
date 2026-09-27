@@ -112,9 +112,10 @@ func (s *Store) MergeChain(chainDir string, rings int) error {
 		return err
 	}
 	defer lease.release()
-	// Repair or clear debris from a merge killed mid-commit before inspecting
-	// the chain, exactly as the next backup or open of the directory would.
-	sweepMergeDebris(chainDir)
+	// Repair or clear debris from a merge or a verification killed mid-commit
+	// before inspecting the chain, exactly as the next backup or open of the
+	// directory would.
+	sweepChainDebris(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

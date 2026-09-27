@@ -89,6 +89,9 @@ func TestChainLeaseMutualExclusion(t *testing.T) {
 	if _, err := Restore(chain, filepath.Join(t.TempDir(), "r0")); !errors.Is(err, fs.ErrInvalid) {
 		t.Fatalf("restore under held lease: %v", err)
 	}
+	if err := s.VerifyChain(chain); !errors.Is(err, fs.ErrInvalid) {
+		t.Fatalf("verify under held lease: %v", err)
+	}
 	// The rejected operations left the chain exactly as it was: one ring,
 	// and the chain still validates and restores.
 	if got := ringFiles(t, chain); len(got) != 1 {

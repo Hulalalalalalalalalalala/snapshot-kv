@@ -157,9 +157,9 @@ func (s *Store) Backup(outDir string) error {
 	defer lease.release()
 	// Prepare the output directory and clear debris from an export killed
 	// mid-run, before touching the store. A finished artifact or any foreign
-	// entry is never overwritten. Debris from a chain merge killed mid-commit
-	// next to this directory is repaired or swept first.
-	sweepMergeDebris(outDir)
+	// entry is never overwritten. Debris from a chain merge or a verification
+	// killed mid-commit next to this directory is repaired or swept first.
+	sweepChainDebris(outDir)
 	info, err := os.Stat(outDir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {

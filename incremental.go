@@ -700,9 +700,9 @@ func (s *Store) BackupIncremental(chainDir string) error {
 		return err
 	}
 	defer lease.release()
-	// Repair or clear debris from a merge killed mid-commit before inspecting
-	// the chain.
-	sweepMergeDebris(chainDir)
+	// Repair or clear debris from a merge or verification killed mid-commit
+	// before inspecting the chain.
+	sweepChainDebris(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

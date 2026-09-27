@@ -24,6 +24,7 @@ Go 1.22 or newer. Standard library only.
 - `(*Store).Backup(outDir string) error` exports one consistent committed state as a portable, segmented artifact.
 - `(*Store).BackupIncremental(chainDir string) error` appends one incremental ring to an existing backup chain.
 - `(*Store).MergeChain(chainDir string, rings int) error` folds the chain head and its first rings into one new full head and retires the absorbed rings.
+- `(*Store).VerifyChain(chainDir string) error` verifies a chain and self-heals a damaged incremental suffix by downgrading to the last intact prefix.
 - `snapshot.Restore(backupDir, targetDir string) (*Store, error)` installs a backup (a lone full artifact or a full head plus its incremental rings) into a fresh directory and returns it open.
 - `(*Snapshot).Get(key string) ([]byte, bool)` reads from that view.
 - `(*Snapshot).Close() error`, `(*Store).Close() error`.
@@ -322,26 +323,75 @@ during the merge, rejects the whole operation with an error satisfying
 `MergeChain` on a closed store returns an error satisfying
 `errors.Is(err, fs.ErrClosed)`.
 
+### Online chain verification and self-healing
+
+`VerifyChain(chainDir)` checks a backup chain online and, when an incremental
+ring is damaged, heals it before recovery, merge or a later export can run on
+the damage. It walks the chain segment by segment — the head manifest and its
+segments, then the rings in ring order — and verifies watermark continuity,
+every CRC and the format version, streaming in bounded reads so neither the
+whole chain nor the whole keyspace is held in memory and peak memory does not
+grow with chain length.
+
+- A whole chain passes with `nil` and is left byte-for-byte unchanged: not one
+  file in the chain directory moves.
+- A damaged incremental ring (a missing ring, a broken predecessor link, a
+  non-continuous watermark, truncation, a checksum mismatch or an unknown
+  version) is isolated at ring granularity: the chain is downgraded to its
+  longest intact prefix — the head plus the rings before the first defect —
+  and `VerifyChain` still returns `nil`. The isolated artifacts are moved
+  byte-for-byte into a diagnostic sibling directory next to the chain
+  (`<chain>.diag-*`); the chain directory then holds only intact rings. The
+  downgraded chain restores byte-for-byte to the state a full replay reaches
+  at the last intact watermark, with batch atomicity and the cumulative
+  snapshot count intact.
+- A damaged head cannot be downgraded past: with no intact prefix the whole
+  directory is rejected with an error satisfying `errors.Is(err,
+  fs.ErrInvalid)` and is left exactly as it was.
+
+A chain directory that does not exist, is not a directory, holds no usable
+head, contains a foreign file, or whose lease cannot be taken is rejected
+wholesale the same way, again with the directory untouched; every such
+rejection satisfies `errors.Is(err, fs.ErrInvalid)`. `VerifyChain` on a
+closed store returns an error satisfying `errors.Is(err, fs.ErrClosed)`.
+
+Merges and later incremental exports continue on the downgraded ring order:
+numbering stays dense, watermarks meet head-to-tail, and deletes covered by
+the absorbed rings are never resurrected — including a delete that a
+compaction has forgotten entirely, which is still recorded as a tombstone.
+The downgrade is one atomic sibling-directory swap, so a process killed at
+any point leaves either the chain before verification or the fully
+downgraded chain, always a complete chain; staging or trash siblings left
+behind are swept at the next backup, merge, verification or open of a related
+directory, which is immediately usable.
+
+`VerifyChain` first takes the chain directory's existing lease, so it is
+mutually exclusive with backup, incremental export, merge and restore, and
+the lease file stays outside the chain. It never touches the backed-up store
+and holds no store lock: writes, batch commits, snapshot open/close, cursor
+paging, checkpoints and compactions proceed while it runs, and reads keep
+hitting memory.
+
 ### Chain directory coordination
 
 A chain directory can be shared by several store objects, in one process or
 across processes, so every operation that works on it — `Backup`,
-`BackupIncremental`, `MergeChain` and `Restore` — first takes the chain's
-**lease**: a small sibling file (`<chain>.lease`) naming its holder (a
-process id plus a random token) and carrying an expiry time. At most one
-registered operation holds the lease at a time, so concurrent exports,
-merges and restores on the same chain directory are mutually exclusive and
-the chain is at every instant either the old chain or the complete new one,
-never an in-between mixture.
+`BackupIncremental`, `MergeChain`, `VerifyChain` and `Restore` — first takes
+the chain's **lease**: a small sibling file (`<chain>.lease`) naming its
+holder (a process id plus a random token) and carrying an expiry time. At
+most one registered operation holds the lease at a time, so concurrent
+exports, merges, verifications and restores on the same chain directory are
+mutually exclusive and the chain is at every instant either the old chain or
+the complete new one, never an in-between mixture.
 
 The lease is never waited on: an operation that cannot take it fails
 wholesale with an error satisfying `errors.Is(err, fs.ErrInvalid)` and
 touches nothing on or around the chain. A holder that is force-killed leaves
-the lease file behind, and the next backup, merge, restore or open of a
-related directory recognizes it as stale — the holder process is gone or its
-expiry has passed — reclaims it and proceeds; a live holder renews its
-expiry for as long as it runs, so a slow export or merge is never reclaimed
-from under itself. The chain is therefore never wedged behind a dead holder
+the lease file behind, and the next backup, merge, verification, restore or
+open of a related directory recognizes it as stale — the holder process is
+gone or its expiry has passed — reclaims it and proceeds; a live holder
+renews its expiry for as long as it runs, so a slow export or merge is never
+reclaimed from under itself. The chain is therefore never wedged behind a dead holder
 and needs no manual cleanup. The lease file lives next to the chain
 directory, not inside it, so it is never part of the validated artifact.
 

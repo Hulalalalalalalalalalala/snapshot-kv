@@ -54,9 +54,9 @@ func Restore(backupDir, targetDir string) (*Store, error) {
 	defer lease.release()
 
 	// The artifact itself must be an existing directory whose only entries are
-	// the manifest and the segments it names. A merge killed mid-commit next
-	// to the chain is repaired or swept first.
-	sweepMergeDebris(backupDir)
+	// the manifest and the segments it names. A merge or verification killed
+	// mid-commit next to the chain is repaired or swept first.
+	sweepChainDebris(backupDir)
 	binfo, err := os.Stat(backupDir)
 	if err != nil {
 		return nil, errBadBackup
