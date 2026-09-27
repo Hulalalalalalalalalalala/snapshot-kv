@@ -703,6 +703,7 @@ func (s *Store) BackupIncremental(chainDir string) error {
 	// Repair or clear debris from a merge killed mid-commit before inspecting
 	// the chain.
 	sweepMergeDebris(chainDir)
+	sweepVerifyDebris(chainDir)
 	info, err := os.Stat(chainDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
